@@ -3,7 +3,7 @@
    All data stays in this phone's browser storage (IndexedDB). Nothing is uploaded.
    Export creates a ZIP for the laptop Sync helper. */
 
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.1.2';
 const SCHEMA = 1;
 
 /* ---------- Your setup (edit here if wallets or categories change) ---------- */

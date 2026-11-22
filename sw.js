@@ -1,12 +1,15 @@
 // Offline cache for the app's own files. Your entries are NOT here: they live in IndexedDB on the phone.
-const VERSION = 'expenses-v1.1.1';
+const VERSION = 'expenses-v1.1.2';
 const FILES = [
   './', 'index.html', 'app.css', 'app.js', 'vendor/jszip.min.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png'
 ];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(VERSION).then(c => c.addAll(FILES)).then(() => self.skipWaiting()));
+  // cache: 'reload' fetches every file fresh from the server. Without it the browser's own HTTP cache
+  // (GitHub Pages: 10 minutes) could put an old app.js into the new version's cache.
+  e.waitUntil(caches.open(VERSION).then(c => c.addAll(FILES.map(f => new Request(f, { cache: 'reload' }))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', e => {
