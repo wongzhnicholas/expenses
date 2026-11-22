@@ -98,3 +98,26 @@ dialog{border:1px solid var(--line);border-radius:14px;background:var(--card);co
 dialog::backdrop{background:rgba(0,0,0,.4)}
 .navrow{display:flex;align-items:center;justify-content:space-between;margin:10px 0}
 .navrow button{min-width:44px}
+
+/* 1.1: back arrow, typing mode, item scrolling, History receipt button, confirm pop-ups */
+.top .back{border:0;background:none;color:var(--text);font-size:30px;line-height:1;min-width:36px;min-height:36px;
+  padding:0 8px 4px 0;margin:-8px 0 -8px -4px}
+body.typing .tabs{display:none}
+.item{scroll-margin-top:64px}
+.entrow{display:flex;gap:6px;margin-bottom:6px}
+.entrow .ent{margin-bottom:0;flex:1;min-width:0}
+.rcpt{flex:0 0 46px;border:1px solid var(--line);background:var(--card);border-radius:var(--radius);font-size:18px;padding:0}
+.btn.danger.solid{background:var(--danger);border-color:var(--danger);color:#fff;font-weight:600}
+@media (prefers-color-scheme: dark){.btn.danger.solid{color:#2b0d0b}}
+dialog.ask p{margin:8px 0 0}
+.thumb{cursor:zoom-in}
+
+/* receipt viewer */
+body.viewing{overflow:hidden}
+.viewer{position:fixed;inset:0;z-index:20;background:#000;display:flex;flex-direction:column}
+.viewer .vbar{display:flex;align-items:center;gap:6px;padding:6px 6px;padding-top:calc(6px + env(safe-area-inset-top));color:#fff;background:#111}
+.viewer .vbar span{flex:1;min-width:0;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.viewer .vbar button{border:0;background:none;color:#fff;font-size:26px;line-height:1;min-width:44px;min-height:44px}
+.vstage{position:relative;flex:1;overflow:hidden;touch-action:none}
+.vstage img{position:absolute;left:50%;top:50%;max-width:none;transform-origin:center;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+.vhint{position:absolute;left:0;right:0;bottom:calc(16px + env(safe-area-inset-bottom));text-align:center;color:#bbb;font-size:12px;pointer-events:none}

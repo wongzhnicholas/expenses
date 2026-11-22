@@ -3,7 +3,7 @@
    All data stays in this phone's browser storage (IndexedDB). Nothing is uploaded.
    Export creates a ZIP for the laptop Sync helper. */
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const SCHEMA = 1;
 
 /* ---------- Your setup (edit here if wallets or categories change) ---------- */
@@ -20,7 +20,8 @@ const CFG = {
   incomeCats: ['Income', 'TNG Reward', 'Interest', 'Refund', 'Other Income'],
   quickCats: 6,            // category chips shown before "More"
   fillAfter: 2,            // auto-fill once the same choice was made this many times in a row
-  remindDays: 7            // remind to export after this many days
+  remindDays: 7,           // remind to export after this many days
+  photoDays: 30            // every export re-sends photos from this many recent days (plus any never sent)
 };
 const SPEND_WALLETS = CFG.wallets.filter(w => w.kind === 'spend').map(w => w.id);
 const ALL_WALLETS = CFG.wallets.map(w => w.id);
@@ -56,6 +57,21 @@ function h(tag, attrs = {}, ...kids) {
   }
   for (const k of kids.flat()) if (k != null && k !== false) el.append(k.nodeType ? k : document.createTextNode(k));
   return el;
+}
+// Pop-up with Cancel (left) and an action (right). Resolves true only if the action is tapped.
+// armMs keeps the action disabled briefly, so a fast double tap can't go through two pop-ups at once.
+function ask({ title, lines = [], ok = 'OK', danger = false, armMs = 0 }) {
+  return new Promise(res => {
+    let yes = false;
+    const okBtn = h('button', { class: 'btn grow ' + (danger ? 'danger solid' : 'primary'), type: 'button', disabled: armMs > 0, onclick: () => { yes = true; dlg.close(); } }, ok);
+    const dlg = h('dialog', { class: 'ask' }, h('b', {}, title),
+      lines.filter(Boolean).map(t => h('p', { class: 'small' + (t.startsWith('·') ? ' muted' : '') }, t.replace(/^·\s*/, ''))),
+      h('div', { class: 'row', style: 'margin-top:14px' },
+        h('button', { class: 'btn grow', type: 'button', onclick: () => dlg.close() }, 'Cancel'), okBtn));
+    dlg.addEventListener('close', () => { dlg.remove(); res(yes); });
+    document.body.append(dlg); dlg.showModal();
+    if (armMs > 0) setTimeout(() => { okBtn.disabled = false; }, armMs);
+  });
 }
 function toast(msg) {
   const t = $('#toast'); t.textContent = msg; t.hidden = false;
@@ -95,7 +111,7 @@ const DB = {
 /* ---------- App state ---------- */
 const S = {
   entries: [],            // all entries
-  receipts: new Map(),    // name -> {name, entryId, exported}
+  receipts: new Map(),    // name -> {name, entryId, exported, added}
   settings: null,
   tab: 'add'
 };
@@ -112,7 +128,7 @@ async function load() {
   for (const w of ALL_WALLETS) if (!(w in S.settings.opening)) S.settings.opening[w] = 0;
   S.entries = await DB.all('entries');
   const recs = await DB.all('receipts');
-  S.receipts = new Map(recs.map(r => [r.name, { name: r.name, entryId: r.entryId, exported: !!r.exported }]));
+  S.receipts = new Map(recs.map(r => [r.name, { name: r.name, entryId: r.entryId, exported: !!r.exported, added: r.added || '' }]));
 }
 
 /* ---------- Money logic ---------- */
@@ -222,17 +238,99 @@ function receiptName(date, store, entryId) {
 }
 const receiptPath = name => `receipts/${name.slice(0, 4)}/${name}`;
 
+/* ---------- Receipt photo viewer: pinch to zoom, drag, double-tap, rotate (view only) ---------- */
+let VIEWER = null;
+async function openViewer(name, blob, label) {
+  closeViewer();
+  if (!blob && name) { const r = await DB.get('receipts', name); blob = r && r.blob; }
+  if (!blob) { toast('That photo is not on this phone'); return; }
+  const url = URL.createObjectURL(blob);
+  const img = h('img', { alt: 'Receipt photo', draggable: 'false' });
+  const hint = h('div', { class: 'vhint' }, 'Pinch to zoom · drag to move · double-tap');
+  const stage = h('div', { class: 'vstage' }, img, hint);
+  let s = 1, x = 0, y = 0, rot = 0, g = null, lastTap = 0, lastXY = null;
+  const pts = new Map();
+  const el = h('div', { class: 'viewer', role: 'dialog', 'aria-label': 'Receipt photo' },
+    h('div', { class: 'vbar' },
+      h('button', { type: 'button', 'aria-label': 'Back', onclick: () => handleBack() }, '‹'),
+      h('span', {}, label || name || 'Receipt photo'),
+      h('button', { type: 'button', 'aria-label': 'Rotate', onclick: () => { rot = (rot + 90) % 360; fit(); } }, '⟳')),
+    stage);
+  const apply = () => { img.style.transform = `translate(-50%,-50%) translate(${x}px,${y}px) rotate(${rot}deg) scale(${s})`; };
+  function fit() {   // whole photo fits the screen at scale 1
+    const W = stage.clientWidth, H = stage.clientHeight, nw = img.naturalWidth, nh = img.naturalHeight;
+    if (!nw || !nh || !W || !H) return;
+    const base = rot % 180 ? Math.min(W / nh, H / nw) : Math.min(W / nw, H / nh);
+    img.style.width = nw * base + 'px'; img.style.height = nh * base + 'px';
+    s = 1; x = 0; y = 0; apply();
+  }
+  function zoomAt(mx, my, ns, from) {   // zoom so the photo point under (mx, my) stays under it
+    const r = stage.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    ns = Math.min(5, Math.max(1, ns));
+    const px = (mx - cx - from.x) / from.s, py = (my - cy - from.y) / from.s;
+    x = mx - cx - px * ns; y = my - cy - py * ns; s = ns;
+    if (s === 1) { x = 0; y = 0; }
+  }
+  function begin() {
+    const p = [...pts.values()];
+    if (p.length >= 2) g = { type: 'pinch', d: Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y) || 1, mx: (p[0].x + p[1].x) / 2, my: (p[0].y + p[1].y) / 2, s, x, y };
+    else if (p.length === 1) g = { type: 'pan', sx: p[0].x, sy: p[0].y, x, y, moved: !!(g && g.type === 'pinch') };
+    else g = null;
+  }
+  stage.addEventListener('pointerdown', ev => {
+    stage.setPointerCapture(ev.pointerId); hint.hidden = true;
+    pts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY }); begin();
+  });
+  stage.addEventListener('pointermove', ev => {
+    if (!pts.has(ev.pointerId) || !g) return;
+    pts.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    const p = [...pts.values()];
+    if (g.type === 'pinch' && p.length >= 2) {
+      const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y), mx = (p[0].x + p[1].x) / 2, my = (p[0].y + p[1].y) / 2;
+      zoomAt(g.mx, g.my, g.s * d / g.d, g);
+      if (s > 1) { x += mx - g.mx; y += my - g.my; }
+      apply();
+    } else if (g.type === 'pan') {
+      const dx = ev.clientX - g.sx, dy = ev.clientY - g.sy;
+      if (Math.abs(dx) + Math.abs(dy) > 8) g.moved = true;
+      if (s > 1) { x = g.x + dx; y = g.y + dy; apply(); }
+    }
+  });
+  const end = ev => {
+    const was = g;
+    pts.delete(ev.pointerId);
+    if (ev.type === 'pointerup' && was && was.type === 'pan' && !was.moved && !pts.size) {
+      const now = Date.now();
+      if (now - lastTap < 300 && lastXY && Math.hypot(ev.clientX - lastXY.x, ev.clientY - lastXY.y) < 30) {
+        if (s > 1.01) { s = 1; x = 0; y = 0; } else zoomAt(ev.clientX, ev.clientY, 2.5, { s, x, y });
+        apply(); lastTap = 0;
+      } else { lastTap = now; lastXY = { x: ev.clientX, y: ev.clientY }; }
+    }
+    begin();
+  };
+  stage.addEventListener('pointerup', end); stage.addEventListener('pointercancel', end);
+  img.onload = fit; img.src = url;
+  addEventListener('resize', fit);
+  document.body.append(el); document.body.classList.add('viewing');
+  VIEWER = { close() { removeEventListener('resize', fit); URL.revokeObjectURL(url); el.remove(); document.body.classList.remove('viewing'); } };
+}
+function closeViewer() { if (VIEWER) { VIEWER.close(); VIEWER = null; } }
+
 /* ---------- Navigation ---------- */
 let REPAINT = [];   // light refreshers for chip groups (avoid full re-render while typing)
 const TITLES = { add: 'Add', history: 'History', summary: 'Summary', wallets: 'Wallets' };
-function go(tab) {
+// keep = redraw the same screen without jumping back to the top (adding an item, picking a photo, ...)
+function go(tab, keep = false) {
+  const y = window.scrollY, same = tab === S.tab;
   S.tab = tab;
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  $('#title').textContent = tab === 'add' && F && F.id ? 'Edit entry' : TITLES[tab];
+  const editing = tab === 'add' && F && F.id;
+  $('#title').textContent = editing ? 'Edit entry' : TITLES[tab];
+  $('#back').hidden = !editing;
   REPAINT = [];
   const m = $('#main'); m.innerHTML = '';
   ({ add: renderAdd, history: renderHistory, summary: renderSummary, wallets: renderWallets })[tab](m);
-  window.scrollTo(0, 0);
+  window.scrollTo(0, keep && same ? y : 0);
 }
 
 /* ---------- Add / Edit ---------- */
@@ -254,7 +352,16 @@ function formFromEntry(e) {
     note: e.note || '', receiptName: e.receipt || null, created: e.created
   });
   f.touched = new Set(['wallet', 'category', 'store', 'amount']);
+  f.snap = formSnap(f);
   return f;
+}
+const formSnap = f => JSON.stringify([f.type, f.date, f.time, f.store, f.wallet, f.from, f.to, f.amount, f.category, f.note,
+  f.items.map(i => [i.name, i.qty, i.unit, i.orig, i.category]), !!f.receiptBlob, !!f.removeReceipt]);
+// Has the user typed something that Back would throw away?
+function formDirty() {
+  if (!F) return false;
+  if (F.id) return formSnap(F) !== F.snap;
+  return !!(F.store.trim() || num(F.amount) || F.items.length || F.note.trim() || F.receiptBlob);
 }
 function computedTotal() { return r2(F.items.reduce((s, it) => s + itemTotal(it), 0)); }
 
@@ -280,7 +387,7 @@ function renderAdd(m) {
     const seg = h('div', { class: 'seg', role: 'tablist' },
       ['expense', 'income', 'transfer'].map(t => h('button', {
         class: F.type === t ? 'on' : '', type: 'button',
-        onclick: () => { if (F.type !== t) { F.type = t; F.guessed.clear(); go('add'); } }
+        onclick: () => { if (F.type !== t) { F.type = t; F.guessed.clear(); go('add', true); } }
       }, t[0].toUpperCase() + t.slice(1))));
     card.append(seg);
   }
@@ -292,7 +399,7 @@ function renderAdd(m) {
       h('div', { class: 'chips' }, sc.map(c => h('button', {
         class: 'chip small', type: 'button', onclick: () => {
           Object.assign(F, { store: c.store, wallet: c.wallet, category: c.category, amount: String(c.amount) });
-          F.guessed = new Set(['store', 'wallet', 'category', 'amount']); go('add');
+          F.guessed = new Set(['store', 'wallet', 'category', 'amount']); go('add', true);
         }
       }, `${c.store} ${fmt(c.amount)} · ${c.wallet}`))));
   }
@@ -300,10 +407,10 @@ function renderAdd(m) {
   // date
   card.append(h('span', { class: 'lbl' }, 'Date'));
   const t = todayStr(), y = addDays(t, -1);
-  const dateInput = h('input', { type: 'date', value: F.date, max: t, onchange: ev => { F.date = ev.target.value || t; go('add'); } });
+  const dateInput = h('input', { type: 'date', value: F.date, max: t, onchange: ev => { F.date = ev.target.value || t; go('add', true); } });
   card.append(h('div', { class: 'chips' },
-    h('button', { type: 'button', class: 'chip' + (F.date === t ? ' on' : ''), onclick: () => { F.date = t; if (!F.time) F.time = nowTime(); go('add'); } }, 'Today'),
-    h('button', { type: 'button', class: 'chip' + (F.date === y ? ' on' : ''), onclick: () => { F.date = y; F.time = ''; go('add'); } }, 'Yesterday'),
+    h('button', { type: 'button', class: 'chip' + (F.date === t ? ' on' : ''), onclick: () => { F.date = t; if (!F.time) F.time = nowTime(); go('add', true); } }, 'Today'),
+    h('button', { type: 'button', class: 'chip' + (F.date === y ? ' on' : ''), onclick: () => { F.date = y; F.time = ''; go('add', true); } }, 'Yesterday'),
     h('button', { type: 'button', class: 'chip' + (F.date !== t && F.date !== y ? ' on' : ''), onclick: () => dateInput.showPicker ? dateInput.showPicker() : dateInput.focus() }, 'Pick date')
   ));
   card.append(h('div', { class: 'row', style: 'margin-top:6px' },
@@ -432,8 +539,13 @@ function renderExpenseFields(card) {
       if (!F.items.length && num(F.amount) > 0) {
         F.items.push({ key: uid(), name: '', qty: '1', unit: String(F.amount), orig: '', category: F.category || '' });
       } else F.items.push({ key: uid(), name: '', qty: '1', unit: '', orig: '', category: F.category || '' });
-      go('add');
-      setTimeout(() => { const all = document.querySelectorAll('.item input[name=iname]'); if (all.length) all[all.length - 1].focus(); }, 30);
+      go('add', true);
+      // focus the new item's name without a jump, then glide it to the top so it stays above the keyboard
+      const all = document.querySelectorAll('.item'), last = all[all.length - 1];
+      if (last) {
+        last.querySelector('textarea[name=iname]').focus({ preventScroll: true });
+        requestAnimationFrame(() => last.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+      }
     }
   }, '+ Add item'));
   card.append(totalLine); drawTotal();
@@ -446,7 +558,7 @@ function itemRow(it, i, drawTotal) {
   const hintEl = h('div', {});
   const unitInp = h('input', {
     type: 'text', inputmode: 'decimal', placeholder: 'Unit price', value: it.unit, 'aria-label': 'Unit price',
-    class: it.guessUnit ? 'guess' : '',
+    class: it.guessUnit ? 'guess' : '', enterkeyhint: 'next', 'data-nav': '',
     oninput: ev => { it.unit = ev.target.value; it.guessUnit = false; unitInp.classList.remove('guess'); drawTotal(); }
   });
   const catSel = h('select', { 'aria-label': 'Item category', onchange: ev => (it.category = ev.target.value), class: it.guessCat ? 'guess' : '' },
@@ -454,7 +566,7 @@ function itemRow(it, i, drawTotal) {
     CFG.expenseCats.map(c => h('option', { value: c, selected: c === it.category }, c)));
   const origWrap = h('div', { class: 'row', hidden: !(it.orig !== '' && it.orig != null) && !it.showOrig },
     h('span', { class: 'small muted', style: 'white-space:nowrap' }, 'Was RM'),
-    h('input', { type: 'text', inputmode: 'decimal', placeholder: 'original price per unit', value: it.orig ?? '', oninput: ev => { it.orig = ev.target.value; drawTotal(); } }));
+    h('input', { type: 'text', inputmode: 'decimal', placeholder: 'original price per unit', value: it.orig ?? '', enterkeyhint: 'next', 'data-nav': '', oninput: ev => { it.orig = ev.target.value; drawTotal(); } }));
 
   function pickItem(name) {
     it.name = name; nameInp.value = name; box.hidden = true;
@@ -483,7 +595,7 @@ function itemRow(it, i, drawTotal) {
   }
   const grow = () => { nameInp.style.height = 'auto'; nameInp.style.height = nameInp.scrollHeight + 2 + 'px'; };
   const nameInp = h('textarea', {
-    name: 'iname', rows: 1, class: 'auto', placeholder: 'Item (as long as you need)', autocomplete: 'off',
+    name: 'iname', rows: 1, class: 'auto', placeholder: 'Item (as long as you need)', autocomplete: 'off', enterkeyhint: 'next', 'data-nav': '',
     oninput: ev => { it.name = ev.target.value; grow(); showList(); },
     onfocus: () => showList(), onblur: () => setTimeout(() => { box.hidden = true; showHint(); }, 180)
   });
@@ -503,11 +615,11 @@ function itemRow(it, i, drawTotal) {
   setTimeout(() => { showHint(); grow(); }, 0);
   return h('div', { class: 'item' },
     h('div', { class: 'row' }, h('div', { class: 'wrap grow' }, nameInp, box),
-      h('button', { type: 'button', class: 'x', 'aria-label': 'Remove item', onclick: () => { F.items.splice(i, 1); go('add'); } }, '×')),
+      h('button', { type: 'button', class: 'x', 'aria-label': 'Remove item', onclick: () => { F.items.splice(i, 1); go('add', true); } }, '×')),
     hintEl,
     h('div', { class: 'row' },
       h('span', { class: 'small muted' }, 'Qty'),
-      h('input', { type: 'text', inputmode: 'decimal', value: it.qty, style: 'width:64px', 'aria-label': 'Quantity', oninput: ev => { it.qty = ev.target.value; drawTotal(); } }),
+      h('input', { type: 'text', inputmode: 'decimal', value: it.qty, style: 'width:64px', 'aria-label': 'Quantity', enterkeyhint: 'next', 'data-nav': '', oninput: ev => { it.qty = ev.target.value; drawTotal(); } }),
       h('div', { class: 'grow' }, unitInp)),
     origWrap,
     h('div', { class: 'row' }, h('div', { class: 'grow' }, catSel),
@@ -533,7 +645,7 @@ function renderTransferFields(card) {
         F.from = p.from; F.to = p.to;
         const top = [...p.amounts.entries()].sort((a, b) => b[1] - a[1])[0];
         if (top && top[1] >= CFG.fillAfter && !F.amount) F.amount = String(top[0]);
-        go('add');
+        go('add', true);
       }
     }, `${p.from} → ${p.to}`))));
   card.append(...walletChips('from', ALL_WALLETS, 'From'));
@@ -544,7 +656,7 @@ function renderTransferFields(card) {
   if (p) {
     const common = [...p.amounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(a => a[0]);
     card.append(h('div', { class: 'chips', style: 'margin-top:6px' }, common.map(a =>
-      h('button', { type: 'button', class: 'chip small', onclick: () => { F.amount = String(a); go('add'); } }, fmt(a)))));
+      h('button', { type: 'button', class: 'chip small', onclick: () => { F.amount = String(a); go('add', true); } }, fmt(a)))));
   }
 }
 
@@ -555,7 +667,7 @@ function receiptBlock() {
   const gal = h('input', { type: 'file', accept: 'image/*', hidden: true, onchange: ev => pick(ev) });
   async function pick(ev) {
     const f = ev.target.files && ev.target.files[0]; if (!f) return;
-    try { F.receiptBlob = await compressImage(f); F.removeReceipt = false; go('add'); }
+    try { F.receiptBlob = await compressImage(f); F.removeReceipt = false; go('add', true); }
     catch (e) { toast('Could not read that photo'); }
   }
   const has = F.receiptBlob || (F.receiptName && !F.removeReceipt);
@@ -563,13 +675,13 @@ function receiptBlock() {
     h('button', { type: 'button', class: 'btn grow', onclick: () => cam.click() }, has ? 'Retake photo' : 'Take photo'),
     h('button', { type: 'button', class: 'btn grow', onclick: () => gal.click() }, 'From gallery')));
   if (has) {
-    const img = h('img', { class: 'thumb', alt: 'Receipt photo' });
+    const nm = F.type === 'expense' || F.type === 'income' ? receiptName(F.date, F.store || F.category, F.id) : '';
+    const img = h('img', { class: 'thumb', alt: 'Receipt photo (tap to enlarge)', onclick: () => openViewer(F.receiptBlob ? null : F.receiptName, F.receiptBlob, nm) });
     if (F.receiptBlob) img.src = URL.createObjectURL(F.receiptBlob);
     else DB.get('receipts', F.receiptName).then(r => { if (r && r.blob) img.src = URL.createObjectURL(r.blob); });
-    const nm = F.type === 'expense' || F.type === 'income' ? receiptName(F.date, F.store || F.category, F.id) : '';
     wrap.append(img, h('div', { class: 'row small muted', style: 'justify-content:space-between' },
-      h('span', {}, 'Saved as ' + nm),
-      h('button', { type: 'button', class: 'btn link small', onclick: () => { F.receiptBlob = null; F.removeReceipt = true; go('add'); } }, 'Remove')));
+      h('span', {}, 'Saved as ' + nm + ' · tap photo to enlarge'),
+      h('button', { type: 'button', class: 'btn link small', onclick: () => { F.receiptBlob = null; F.removeReceipt = true; go('add', true); } }, 'Remove')));
   }
   return wrap;
 }
@@ -628,15 +740,15 @@ async function saveEntry() {
     if (F.receiptBlob) {
       if (oldName) { await DB.del('receipts', oldName); S.receipts.delete(oldName); }
       const name = receiptName(e.date, e.store || e.category, e.id);
-      await DB.put('receipts', { name, entryId: e.id, blob: F.receiptBlob, exported: false });
-      S.receipts.set(name, { name, entryId: e.id, exported: false }); e.receipt = name;
+      await DB.put('receipts', { name, entryId: e.id, blob: F.receiptBlob, exported: false, added: now });
+      S.receipts.set(name, { name, entryId: e.id, exported: false, added: now }); e.receipt = name;
     } else if (oldName && !F.removeReceipt) {
       const name = receiptName(e.date, e.store || e.category, e.id);
       if (name !== oldName) {
         const r = await DB.get('receipts', oldName);
         await DB.del('receipts', oldName); S.receipts.delete(oldName);
-        await DB.put('receipts', { name, entryId: e.id, blob: r.blob, exported: false });
-        S.receipts.set(name, { name, entryId: e.id, exported: false });
+        await DB.put('receipts', { name, entryId: e.id, blob: r.blob, exported: false, added: r.added || now });
+        S.receipts.set(name, { name, entryId: e.id, exported: false, added: r.added || now });
       }
       e.receipt = name;
     } else if (oldName && F.removeReceipt) { await DB.del('receipts', oldName); S.receipts.delete(oldName); }
@@ -653,8 +765,16 @@ async function saveEntry() {
 }
 
 async function deleteEntry() {
-  if (!confirm('Delete this entry? This can\'t be undone.')) return;
   const e = S.entries.find(x => x.id === F.id);
+  if (!e) return;
+  const what = e.type === 'transfer' ? `${e.from} → ${e.to}` : e.type === 'adjust' ? `Adjustment · ${e.wallet}` : (e.store || e.category);
+  const n = (e.items || []).length;
+  const extra = [n ? `${n} item${n > 1 ? 's' : ''}` : '', e.receipt ? `receipt photo ${e.receipt}` : ''].filter(Boolean).join(' · ');
+  if (!(await ask({ title: 'Delete this entry?', lines: [`${what} · RM ${fmt(Math.abs(num(e.amount)))} · ${niceDate(e.date)}`, extra ? '· ' + extra : ''], ok: 'Delete' }))) return;
+  if (!(await ask({
+    title: 'Are you sure?', lines: [e.receipt ? 'The entry and its receipt photo will be removed from this phone.' : 'The entry will be removed from this phone.'],
+    ok: 'Yes, delete', danger: true, armMs: 600
+  }))) return;
   if (e && e.receipt) { await DB.del('receipts', e.receipt); S.receipts.delete(e.receipt); }
   await DB.del('entries', F.id);
   S.entries = S.entries.filter(x => x.id !== F.id);
@@ -672,10 +792,12 @@ function entryLine(e) {
   } else if (e.type === 'income') { title = e.store || e.category; sub = `${e.category} · into ${e.wallet}`; amt = '+' + fmt(e.amount); cls = 'in'; }
   else if (e.type === 'transfer') { title = `${e.from} → ${e.to}`; sub = 'Transfer'; amt = fmt(e.amount); cls = 'tr'; }
   else { title = `Adjustment · ${e.wallet}`; sub = 'Reconcile'; amt = (e.amount >= 0 ? '+' : '−') + fmt(Math.abs(e.amount)); cls = 'tr'; }
-  if (e.receipt) sub += ' · receipt';
   if (e.note) sub += ' · ' + e.note;
-  return h('button', { class: 'ent', type: 'button', onclick: () => { F = formFromEntry(e); go('add'); } },
+  const row = h('button', { class: 'ent', type: 'button', onclick: () => { F = formFromEntry(e); go('add'); } },
     h('div', {}, h('div', {}, title), h('div', { class: 'sub' }, sub)), h('div', { class: 'amt ' + cls }, amt));
+  if (!e.receipt) return row;
+  return h('div', { class: 'entrow' }, row,
+    h('button', { class: 'rcpt', type: 'button', 'aria-label': 'View receipt photo', onclick: () => openViewer(e.receipt) }, '🧾'));
 }
 function matches(e, q) {
   if (!q) return true;
@@ -810,26 +932,36 @@ function renderWallets(m) {
   m.append(ob);
 
   // export
-  const unexportedReceipts = [...S.receipts.values()].filter(r => !r.exported).length;
+  const nPhotos = photosForExport(false).length;
   const ex = h('div', { class: 'card' }, h('b', {}, 'Export for laptop'),
     h('p', { class: 'small muted' }, S.settings.lastExportAt ? `Last export: ${new Date(S.settings.lastExportAt).toLocaleString('en-MY')}` : 'Not exported yet.'),
-    h('p', { class: 'small' }, `${S.entries.length} entries in total · ${unexportedReceipts} new receipt photo${unexportedReceipts === 1 ? '' : 's'} to send`),
-    h('div', { class: 'row' },
-      h('button', { class: 'btn primary grow', type: 'button', onclick: () => doExport(false, 'download') }, 'Save to Downloads'),
-      navigator.canShare ? h('button', { class: 'btn grow', type: 'button', onclick: () => doExport(false, 'share') }, 'Share…') : null),
-    h('p', { class: 'small muted' }, 'Each export has every entry, plus receipt photos not sent before. A full backup also includes all receipt photos.'),
-    h('button', { class: 'btn full', type: 'button', onclick: () => doExport(true, 'download') }, 'Full backup (with all photos)'));
+    h('p', { class: 'small' }, `${S.entries.length} entr${S.entries.length === 1 ? 'y' : 'ies'} · ${nPhotos} photo${nPhotos === 1 ? '' : 's'} from the last ${CFG.photoDays} days`),
+    h('button', { class: 'btn primary full', type: 'button', onclick: () => doExport(false) }, 'Export for laptop'),
+    h('p', { class: 'small muted' }, `Saved to Downloads. It has every entry, plus photos from the last ${CFG.photoDays} days, so a missed export never loses a photo.`),
+    h('p', { class: 'small muted' }, 'To send by Telegram: in Telegram tap 📎 → File, open Downloads and pick the ZIP. Or copy it by USB to ExpenseSync\\Inbox.'));
   m.append(ex);
 
   // restore + storage
-  const fileIn = h('input', { type: 'file', accept: '.zip,application/zip', hidden: true, onchange: ev => restore(ev.target.files[0]) });
+  const fileIn = h('input', { type: 'file', accept: '.zip,application/zip', hidden: true, onchange: ev => { const f = ev.target.files[0]; ev.target.value = ''; restore(f); } });
   const persistTxt = h('span', { class: 'small muted' }, 'Checking storage…');
   if (navigator.storage && navigator.storage.persisted) navigator.storage.persisted().then(p => { persistTxt.textContent = p ? 'Storage: protected from automatic clearing.' : 'Storage: not yet protected. It becomes protected after you install the app and save entries.'; });
   else persistTxt.textContent = '';
+  // space used by this app on the phone (entries + photos + offline copy); hidden if Chrome can't report it
+  const spaceTxt = h('p', { class: 'small muted', hidden: true });
+  if (navigator.storage && navigator.storage.estimate) navigator.storage.estimate().then(({ usage }) => {
+    if (usage == null) return;
+    const size = usage < 1048576 ? `${Math.max(1, Math.round(usage / 1024))} KB` : `${(usage / 1048576).toFixed(1)} MB`;
+    const np = S.receipts.size, ne = S.entries.length;
+    spaceTxt.textContent = `Space used: ${size} · ${np.toLocaleString('en-MY')} receipt photo${np === 1 ? '' : 's'} · ${ne.toLocaleString('en-MY')} entr${ne === 1 ? 'y' : 'ies'}`;
+    spaceTxt.hidden = false;
+  }).catch(() => { });
   m.append(h('div', { class: 'card' }, h('b', {}, 'Backup and restore'),
+    h('button', { class: 'btn full', type: 'button', onclick: () => doExport(true) }, 'Full backup (every photo)'),
+    h('p', { class: 'small muted' }, 'Every entry and every photo, for moving to a new phone. Saved to Downloads.' +
+      (S.settings.lastFullBackupAt ? ` Last full backup: ${new Date(S.settings.lastFullBackupAt).toLocaleDateString('en-MY')}.` : '')),
     h('p', { class: 'small muted' }, 'Restoring replaces everything on this phone with the contents of an export or full backup ZIP.'),
     fileIn, h('button', { class: 'btn full', type: 'button', onclick: () => fileIn.click() }, 'Restore from ZIP…'),
-    h('p', {}, persistTxt), h('p', { class: 'small faint' }, `App version ${APP_VERSION}`)));
+    h('p', {}, persistTxt), spaceTxt, h('p', { class: 'small faint' }, `App version ${APP_VERSION}`)));
 }
 function walletRow(w, v) {
   return h('div', { class: 'wl' },
@@ -884,28 +1016,32 @@ async function buildZip(full) {
   zip.file('data.json', JSON.stringify(data, null, 1));
   zip.file('entries.csv', '﻿' + toCSV(flatRows()));
   const sent = [];
-  for (const r of S.receipts.values()) {
-    if (!full && r.exported) continue;
+  for (const r of photosForExport(full)) {
     const rec = await DB.get('receipts', r.name);
     if (rec && rec.blob) { zip.file(receiptPath(r.name), rec.blob); sent.push(r.name); }
   }
   const blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
   return { blob, sent };
 }
-async function doExport(full, how) {
+// A normal export re-sends every photo from the last CFG.photoDays days, plus any never sent, so one ZIP that
+// never reached the laptop can't lose a photo. (Sync skips photos it already has.) A full backup has every photo.
+function photosForExport(full) {
+  const cutoff = addDays(todayStr(), -CFG.photoDays);
+  return [...S.receipts.values()].filter(r => {
+    if (full || !r.exported) return true;
+    const named = /^\d{8}/.test(r.name) ? `${r.name.slice(0, 4)}-${r.name.slice(4, 6)}-${r.name.slice(6, 8)}` : '';
+    const added = r.added ? localDate(new Date(r.added)) : '';
+    return (added > named ? added : named) >= cutoff;
+  });
+}
+async function doExport(full) {
   try {
     toast('Preparing export…');
     const { blob, sent } = await buildZip(full);
     const d = new Date();
     const name = `expenses-${full ? 'full-' : ''}${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.zip`;
-    if (how === 'share') {
-      const file = new File([blob], name, { type: 'application/zip' });
-      if (!navigator.canShare({ files: [file] })) { toast('Sharing not available; saving instead'); return doExport(full, 'download'); }
-      await navigator.share({ files: [file], title: name });
-    } else {
-      const a = h('a', { href: URL.createObjectURL(blob), download: name });
-      document.body.append(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
-    }
+    const a = h('a', { href: URL.createObjectURL(blob), download: name });
+    document.body.append(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
     for (const n of sent) {
       const rec = await DB.get('receipts', n);
       if (rec) { rec.exported = true; await DB.put('receipts', rec); S.receipts.get(n).exported = true; }
@@ -913,9 +1049,8 @@ async function doExport(full, how) {
     S.settings.lastExportAt = d.toISOString(); S.settings.changedSinceExport = false;
     if (full) S.settings.lastFullBackupAt = d.toISOString();
     await saveSettings();
-    toast(`Exported ${name}`); go('wallets');
+    toast(`Saved ${name} to Downloads`); go('wallets', true);
   } catch (e) {
-    if (e && e.name === 'AbortError') { toast('Export cancelled'); return; }
     console.error(e); toast('Export failed: ' + (e && e.message || e));
   }
 }
@@ -926,7 +1061,16 @@ async function restore(file) {
     const jf = zip.file('data.json'); if (!jf) throw new Error('This ZIP has no data.json');
     const data = JSON.parse(await jf.async('string'));
     if (data.app !== 'expenses-offline') throw new Error('This is not an Expenses export');
-    if (!confirm(`Replace everything on this phone with ${data.entries.length} entries from this file?`)) return;
+    const nNow = S.entries.length, nNew = data.entries.length, nPh = (data.receipts || []).filter(r => zip.file(r.path)).length;
+    if (!(await ask({
+      title: 'Restore from this file?',
+      lines: [`${file.name}: ${nNew} entr${nNew === 1 ? 'y' : 'ies'} and ${nPh} photo${nPh === 1 ? '' : 's'}.`, `· This replaces everything on this phone (${nNow} entr${nNow === 1 ? 'y' : 'ies'} now).`],
+      ok: 'Restore'
+    }))) return;
+    if (!(await ask({
+      title: 'Are you sure?', lines: [`The ${nNow} entr${nNow === 1 ? 'y' : 'ies'} and photos on this phone will be replaced by the ones in this file.`],
+      ok: 'Yes, replace', danger: true, armMs: 600
+    }))) return;
     await DB.clear('entries'); await DB.clear('receipts');
     for (const e of data.entries) await DB.put('entries', e);
     let missing = 0;
@@ -952,10 +1096,67 @@ document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click
   if (b.dataset.tab !== 'add' && F && F.id) F = null;   // leaving an edit discards it
   go(b.dataset.tab);
 }));
+$('#back').addEventListener('click', () => handleBack());
+
+/* ---------- Phone Back button ----------
+   One extra history entry (the "guard") catches Android's Back, so the app steps back instead of closing. */
+let backArmed = false;
+function armBack() { if (!backArmed) { history.pushState({ app: 'guard' }, ''); backArmed = true; } }
+function atHome() { return !VIEWER && !document.querySelector('dialog[open]') && S.tab === 'add' && !(F && F.id) && !formDirty(); }
+async function handleBack() {
+  if (VIEWER) { closeViewer(); return; }
+  const dlg = document.querySelector('dialog[open]');
+  if (dlg) { dlg.close(); return; }
+  if (S.tab === 'add' && F && F.id) {
+    if (formDirty() && !(await ask({ title: 'Discard changes?', lines: ['Your changes to this entry will be lost.'], ok: 'Discard' }))) return;
+    F = null; go('history'); return;
+  }
+  if (S.tab !== 'add') { go('add'); return; }
+  if (formDirty() && await ask({ title: 'Discard this entry?', lines: ['What you have typed will be cleared.'], ok: 'Discard' })) {
+    F = blankForm(F.type); go('add');
+  }
+}
+addEventListener('popstate', () => {
+  backArmed = false;
+  if (atHome()) {            // nothing to step back from: warn once, a second Back within 2 s closes the app
+    toast('Press back again to exit');
+    setTimeout(armBack, 2000);
+    return;
+  }
+  armBack(); handleBack();
+});
+document.addEventListener('pointerdown', armBack, true);   // any tap = still using the app
+
+/* ---------- While typing: hide the bottom tab bar; keyboard "Next" moves through an item's fields ---------- */
+function updTyping() {
+  const a = document.activeElement;
+  const field = !!a && !!a.matches && a.matches('input:not([type=date]):not([type=time]):not([type=file]), textarea, select') && !a.closest('dialog');
+  const vv = window.visualViewport;
+  const keyboard = !vv || window.innerHeight - vv.height > 120;
+  document.body.classList.toggle('typing', field && keyboard);
+}
+document.addEventListener('focusin', updTyping);
+document.addEventListener('focusout', () => setTimeout(updTyping, 0));
+if (window.visualViewport) visualViewport.addEventListener('resize', updTyping);
+function navNext(el) {
+  const all = [...document.querySelectorAll('#main [data-nav]')].filter(x => x.offsetParent !== null);
+  const next = all[all.indexOf(el) + 1];
+  if (next) next.focus(); else el.blur();
+}
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Enter' && ev.target.matches && ev.target.matches('[data-nav]')) { ev.preventDefault(); navNext(ev.target); }
+});
+document.addEventListener('beforeinput', ev => {   // some phone keyboards send Enter only as a line break
+  if ((ev.inputType === 'insertLineBreak' || ev.inputType === 'insertParagraph') && ev.target.matches && ev.target.matches('[data-nav]')) {
+    ev.preventDefault(); navNext(ev.target);
+  }
+});
+
 const net = () => { $('#offline').hidden = navigator.onLine; };
 addEventListener('online', net); addEventListener('offline', net);
 (async () => {
   try { await load(); } catch (e) { $('#main').textContent = 'Storage unavailable: ' + e.message; return; }
   net(); go('add');
+  history.replaceState({ app: 'root' }, ''); armBack();
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
 })();
