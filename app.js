@@ -3,7 +3,7 @@
    All data stays in this phone's browser storage (IndexedDB). Nothing is uploaded.
    Export creates a ZIP for the laptop Sync helper. */
 
-const APP_VERSION = '1.1.2';
+const APP_VERSION = '1.2.1';
 const SCHEMA = 1;
 
 /* ---------- Your setup (edit here if wallets or categories change) ---------- */
@@ -44,6 +44,21 @@ const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString
 const norm = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const safeName = s => String(s || '').replace(/[\\/:*?"<>|]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60) || 'Receipt';
+
+/* Cash-register money entry: type digits only, the last two are sen (1, 2, 3, 0 -> 12.30); backspace drops the last digit.
+   Spread MONEY into an input's attributes and call cashify(ev) in its oninput; it returns the new value ('' when empty). */
+const MONEY = {
+  type: 'text', inputmode: 'numeric', pattern: '[0-9]*', autocomplete: 'off',
+  onfocus: ev => setTimeout(() => caretEnd(ev.target), 0), onclick: ev => caretEnd(ev.target)
+};
+function caretEnd(el) { try { el.setSelectionRange(el.value.length, el.value.length); } catch (_) { } }
+function cashify(ev) {
+  const el = ev.target;
+  const digits = el.value.replace(/\D/g, '').replace(/^0+/, '').slice(0, 9);
+  el.value = digits ? (parseInt(digits, 10) / 100).toFixed(2) : '';
+  caretEnd(el);
+  return el.value;
+}
 
 function h(tag, attrs = {}, ...kids) {
   const el = document.createElement(tag);
@@ -374,6 +389,8 @@ function renderAdd(m) {
   if (!S.settings.openingSet && !isEdit)
     m.append(h('div', { class: 'banner info' }, 'Start by entering your opening wallet balances. ',
       h('button', { class: 'btn link', onclick: () => go('wallets') }, 'Go to Wallets')));
+  if (F.copiedFrom && !isEdit)
+    m.append(h('div', { class: 'banner info' }, `↻ Copied from ${F.copiedFrom}. Check quantities and prices, then Save.`));
   if (needsExportReminder() && !isEdit)
     m.append(h('div', { class: 'banner' }, 'You have entries that are not exported yet. ',
       h('button', { class: 'btn link', onclick: () => go('wallets') }, 'Export now')));
@@ -400,7 +417,7 @@ function renderAdd(m) {
     if (sc.length) card.append(h('span', { class: 'lbl' }, 'Usual at this time'),
       h('div', { class: 'chips' }, sc.map(c => h('button', {
         class: 'chip small', type: 'button', onclick: () => {
-          Object.assign(F, { store: c.store, wallet: c.wallet, category: c.category, amount: String(c.amount) });
+          Object.assign(F, { store: c.store, wallet: c.wallet, category: c.category, amount: money2(c.amount) });
           F.guessed = new Set(['store', 'wallet', 'category', 'amount']); go('add', true);
         }
       }, `${c.store} ${fmt(c.amount)} · ${c.wallet}`))));
@@ -433,6 +450,12 @@ function renderAdd(m) {
 
   const err = h('div', { class: 'err', id: 'formErr', role: 'alert' });
   card.append(err);
+  if (isEdit && F.type !== 'adjust') card.append(h('button', {
+    class: 'btn full', type: 'button', style: 'margin-top:12px', onclick: async () => {
+      if (formDirty() && !(await ask({ title: 'Discard changes?', lines: ['Your unsaved changes to this entry will be lost. The saved version is copied.'], ok: 'Discard' }))) return;
+      repeatEntry(S.entries.find(x => x.id === F.id));
+    }
+  }, '↻ Repeat as new entry (today)'));
   const actions = h('div', { class: 'row', style: 'margin-top:12px' });
   if (isEdit) actions.append(h('button', { class: 'btn danger', type: 'button', onclick: deleteEntry }, 'Delete'),
     h('button', { class: 'btn', type: 'button', onclick: () => { F = null; go('history'); } }, 'Cancel'));
@@ -521,8 +544,8 @@ function renderExpenseFields(card) {
   if (!hasItems) {
     card.append(h('span', { class: 'lbl' }, 'Amount (RM)'),
       h('input', {
-        type: 'text', inputmode: 'decimal', class: 'big' + (F.guessed.has('amount') ? ' guess' : ''), value: F.amount, placeholder: '0.00',
-        oninput: ev => { F.amount = ev.target.value; F.guessed.delete('amount'); ev.target.classList.remove('guess'); }
+        ...MONEY, class: 'big' + (F.guessed.has('amount') ? ' guess' : ''), value: F.amount, placeholder: '0.00',
+        oninput: ev => { F.amount = cashify(ev); F.guessed.delete('amount'); ev.target.classList.remove('guess'); }
       }));
   }
   card.append(h('span', { class: 'lbl' }, hasItems ? 'Items' : 'Items (optional)'));
@@ -540,7 +563,7 @@ function renderExpenseFields(card) {
   card.append(h('button', {
     type: 'button', class: 'btn link', onclick: () => {
       if (!F.items.length && num(F.amount) > 0) {
-        F.items.push({ key: uid(), name: '', qty: '1', unit: String(F.amount), orig: '', category: F.category || '' });
+        F.items.push({ key: uid(), name: '', qty: '1', unit: money2(F.amount), orig: '', category: F.category || '' });
       } else F.items.push({ key: uid(), name: '', qty: '1', unit: '', orig: '', category: F.category || '' });
       go('add', true);
       // focus the new item's name without a jump, then glide it to the top so it stays above the keyboard
@@ -560,16 +583,16 @@ function itemRow(it, i, drawTotal) {
   const box = h('div', { class: 'sugg', hidden: true });
   const hintEl = h('div', {});
   const unitInp = h('input', {
-    type: 'text', inputmode: 'decimal', placeholder: 'Unit price', value: it.unit, 'aria-label': 'Unit price',
+    ...MONEY, placeholder: 'Unit price', value: it.unit, 'aria-label': 'Unit price',
     class: it.guessUnit ? 'guess' : '', enterkeyhint: 'next', 'data-nav': '',
-    oninput: ev => { it.unit = ev.target.value; it.guessUnit = false; unitInp.classList.remove('guess'); drawTotal(); }
+    oninput: ev => { it.unit = cashify(ev); it.guessUnit = false; unitInp.classList.remove('guess'); drawTotal(); }
   });
   const catSel = h('select', { 'aria-label': 'Item category', onchange: ev => (it.category = ev.target.value), class: it.guessCat ? 'guess' : '' },
     h('option', { value: '' }, 'Category…'),
     CFG.expenseCats.map(c => h('option', { value: c, selected: c === it.category }, c)));
   const origWrap = h('div', { class: 'row', hidden: !(it.orig !== '' && it.orig != null) && !it.showOrig },
     h('span', { class: 'small muted', style: 'white-space:nowrap' }, 'Was RM'),
-    h('input', { type: 'text', inputmode: 'decimal', placeholder: 'original price per unit', value: it.orig ?? '', enterkeyhint: 'next', 'data-nav': '', oninput: ev => { it.orig = ev.target.value; drawTotal(); } }));
+    h('input', { ...MONEY, placeholder: 'original price per unit', value: it.orig ?? '', enterkeyhint: 'next', 'data-nav': '', oninput: ev => { it.orig = cashify(ev); drawTotal(); } }));
 
   function pickItem(name) {
     it.name = name; nameInp.value = name; box.hidden = true;
@@ -577,10 +600,10 @@ function itemRow(it, i, drawTotal) {
     if (here) {
       const units = here.hist.map(x => x.unit), cats = here.hist.map(x => x.category);
       const ru = repeated(units); const rc = repeated(cats) || here.hist[here.hist.length - 1].category;
-      if (ru != null && !num(it.unit)) { it.unit = String(ru); unitInp.value = it.unit; it.guessUnit = true; unitInp.classList.add('guess'); }
+      if (ru != null && !num(it.unit)) { it.unit = money2(ru); unitInp.value = it.unit; it.guessUnit = true; unitInp.classList.add('guess'); }
       if (rc && !it.category) { it.category = rc; catSel.value = rc; it.guessCat = true; catSel.classList.add('guess'); }
       const lastO = here.hist[here.hist.length - 1].orig;
-      if (lastO != null && lastO !== '' && (it.orig === '' || it.orig == null)) { it.orig = String(lastO); origWrap.hidden = false; origWrap.querySelector('input').value = it.orig; }
+      if (lastO != null && lastO !== '' && (it.orig === '' || it.orig == null)) { it.orig = money2(lastO); origWrap.hidden = false; origWrap.querySelector('input').value = it.orig; }
     }
     showHint(); drawTotal();
   }
@@ -593,7 +616,7 @@ function itemRow(it, i, drawTotal) {
     if (!last) return;
     const where = here ? '' : ` at ${last.store}`;
     hintEl.append(h('button', {
-      type: 'button', class: 'hint', onclick: () => { it.unit = String(last.unit); unitInp.value = it.unit; it.guessUnit = false; unitInp.classList.remove('guess'); drawTotal(); }
+      type: 'button', class: 'hint', onclick: () => { it.unit = money2(last.unit); unitInp.value = it.unit; it.guessUnit = false; unitInp.classList.remove('guess'); drawTotal(); }
     }, `Last: RM ${fmt(last.unit)}${where} · ${niceDate(last.date).slice(4)} — use`));
   }
   const grow = () => { nameInp.style.height = 'auto'; nameInp.style.height = nameInp.scrollHeight + 2 + 'px'; };
@@ -637,7 +660,7 @@ function renderIncomeFields(card) {
   card.append(categoryChips(CFG.incomeCats, () => F.category, c => { F.category = c; F.touched.add('category'); }, () => false));
   card.append(...walletChips('wallet', SPEND_WALLETS.concat(['FD']), 'Received into'));
   card.append(h('span', { class: 'lbl' }, 'Amount (RM)'),
-    h('input', { type: 'text', inputmode: 'decimal', class: 'big', value: F.amount, placeholder: '0.00', oninput: ev => (F.amount = ev.target.value) }));
+    h('input', { ...MONEY, class: 'big', value: F.amount, placeholder: '0.00', oninput: ev => (F.amount = cashify(ev)) }));
 }
 
 function renderTransferFields(card) {
@@ -647,19 +670,19 @@ function renderTransferFields(card) {
       type: 'button', class: 'chip small', onclick: () => {
         F.from = p.from; F.to = p.to;
         const top = [...p.amounts.entries()].sort((a, b) => b[1] - a[1])[0];
-        if (top && top[1] >= CFG.fillAfter && !F.amount) F.amount = String(top[0]);
+        if (top && top[1] >= CFG.fillAfter && !F.amount) F.amount = money2(top[0]);
         go('add', true);
       }
     }, `${p.from} → ${p.to}`))));
   card.append(...walletChips('from', ALL_WALLETS, 'From'));
   card.append(...walletChips('to', ALL_WALLETS, 'To'));
   card.append(h('span', { class: 'lbl' }, 'Amount (RM)'),
-    h('input', { type: 'text', inputmode: 'decimal', class: 'big', value: F.amount, placeholder: '0.00', oninput: ev => (F.amount = ev.target.value) }));
+    h('input', { ...MONEY, class: 'big', value: F.amount, placeholder: '0.00', oninput: ev => (F.amount = cashify(ev)) }));
   const p = pairs.find(x => x.from === F.from && x.to === F.to);
   if (p) {
     const common = [...p.amounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(a => a[0]);
     card.append(h('div', { class: 'chips', style: 'margin-top:6px' }, common.map(a =>
-      h('button', { type: 'button', class: 'chip small', onclick: () => { F.amount = String(a); go('add', true); } }, fmt(a)))));
+      h('button', { type: 'button', class: 'chip small', onclick: () => { F.amount = money2(a); go('add', true); } }, fmt(a)))));
   }
 }
 
@@ -798,9 +821,28 @@ function entryLine(e) {
   if (e.note) sub += ' · ' + e.note;
   const row = h('button', { class: 'ent', type: 'button', onclick: () => { F = formFromEntry(e); go('add'); } },
     h('div', {}, h('div', {}, title), h('div', { class: 'sub' }, sub)), h('div', { class: 'amt ' + cls }, amt));
-  if (!e.receipt) return row;
-  return h('div', { class: 'entrow' }, row,
-    h('button', { class: 'rcpt', type: 'button', 'aria-label': 'View receipt photo', onclick: () => openViewer(e.receipt) }, '🧾'));
+  const side = [];
+  if (e.receipt) side.push(h('button', { class: 'rcpt', type: 'button', 'aria-label': 'View receipt photo', onclick: () => openViewer(e.receipt) }, '🧾'));
+  if (e.type !== 'adjust') side.push(h('button', {
+    class: 'rcpt rep', type: 'button', 'aria-label': 'Repeat as new entry today', onclick: async () => {
+      // the Add tab may hold an entry the user started typing: don't overwrite it silently
+      if (F && !F.id && formDirty() && !(await ask({ title: 'Replace the entry you started?', lines: ['What you typed on Add will be replaced by a copy of this entry.'], ok: 'Replace' }))) return;
+      repeatEntry(e);
+    }
+  }, '↻'));
+  if (!side.length) return row;
+  return h('div', { class: 'entrow' }, row, ...side);
+}
+
+// Copy a saved entry into a new Add form dated today (no photo, no note). The original is untouched.
+function repeatEntry(e) {
+  if (!e || e.type === 'adjust') return;
+  const f = formFromEntry(e);
+  Object.assign(f, { id: null, created: null, date: todayStr(), time: nowTime(), note: '', receiptName: null, receiptBlob: null, removeReceipt: false });
+  delete f.snap;
+  const what = e.type === 'transfer' ? `${e.from} → ${e.to}` : (e.store || e.category);
+  f.copiedFrom = `${what}, ${niceDate(e.date)}`;
+  F = f; go('add');
 }
 function matches(e, q) {
   if (!q) return true;
@@ -922,7 +964,7 @@ function renderWallets(m) {
     h('p', { class: 'small muted' }, 'What each wallet held just before your first entry (e.g. on 1 Dec 2026). Change these only if your starting figures were wrong; use Reconcile for day-to-day differences.'));
   const inputs = {};
   for (const w of ALL_WALLETS) {
-    inputs[w] = h('input', { type: 'text', inputmode: 'decimal', value: S.settings.opening[w] ? String(S.settings.opening[w]) : '', placeholder: '0.00' });
+    inputs[w] = h('input', { ...MONEY, value: S.settings.opening[w] ? money2(S.settings.opening[w]) : '', placeholder: '0.00', oninput: cashify });
     ob.append(h('div', { class: 'row', style: 'margin-top:6px' }, h('span', { style: 'width:90px' }, w), h('div', { class: 'grow' }, inputs[w])));
   }
   ob.append(h('button', {
@@ -973,7 +1015,7 @@ function walletRow(w, v) {
       h('button', { class: 'btn link small', type: 'button', onclick: () => reconcile(w, v) }, 'Reconcile')));
 }
 function reconcile(w, current) {
-  const inp = h('input', { type: 'text', inputmode: 'decimal', placeholder: fmt(current) });
+  const inp = h('input', { ...MONEY, placeholder: fmt(current), oninput: cashify });
   const err = h('div', { class: 'err' });
   const dlg = h('dialog', {},
     h('b', {}, `Reconcile ${w}`),

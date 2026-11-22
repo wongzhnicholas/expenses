@@ -108,6 +108,7 @@ body.typing .tabs{display:none}
 .entrow{display:flex;gap:6px;margin-bottom:6px}
 .entrow .ent{margin-bottom:0;flex:1;min-width:0}
 .rcpt{flex:0 0 46px;border:1px solid var(--line);background:var(--card);border-radius:var(--radius);font-size:18px;padding:0}
+.rcpt.rep{color:var(--accent);font-size:22px}
 .btn.danger.solid{background:var(--danger);border-color:var(--danger);color:#fff;font-weight:600}
 @media (prefers-color-scheme: dark){.btn.danger.solid{color:#2b0d0b}}
 dialog.ask p{margin:8px 0 0}
