@@ -104,6 +104,7 @@ dialog::backdrop{background:rgba(0,0,0,.4)}
   padding:0 8px 4px 0;margin:-8px 0 -8px -4px}
 body.typing .tabs{display:none}
 .item{scroll-margin-top:64px}
+.card.has-items{margin-bottom:60vh}
 .entrow{display:flex;gap:6px;margin-bottom:6px}
 .entrow .ent{margin-bottom:0;flex:1;min-width:0}
 .rcpt{flex:0 0 46px;border:1px solid var(--line);background:var(--card);border-radius:var(--radius);font-size:18px;padding:0}

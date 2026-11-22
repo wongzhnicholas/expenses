@@ -3,7 +3,7 @@
    All data stays in this phone's browser storage (IndexedDB). Nothing is uploaded.
    Export creates a ZIP for the laptop Sync helper. */
 
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.1.1';
 const SCHEMA = 1;
 
 /* ---------- Your setup (edit here if wallets or categories change) ---------- */
@@ -347,8 +347,8 @@ function formFromEntry(e) {
   const f = blankForm(e.type === 'adjust' ? 'income' : e.type);
   Object.assign(f, {
     id: e.id, type: e.type, date: e.date, time: e.time || '', store: e.store || '', wallet: e.wallet || CFG.defaultWallet,
-    from: e.from || 'Maybank', to: e.to || 'TNG', amount: String(e.amount ?? ''), category: e.category || '',
-    items: (e.items || []).map(it => ({ ...it, qty: String(it.qty ?? 1), unit: String(it.unit ?? ''), orig: it.orig == null ? '' : String(it.orig), key: uid() })),
+    from: e.from || 'Maybank', to: e.to || 'TNG', amount: money2(e.amount), category: e.category || '',
+    items: (e.items || []).map(it => ({ ...it, qty: String(it.qty ?? 1), unit: money2(it.unit), orig: money2(it.orig), key: uid() })),
     note: e.note || '', receiptName: e.receipt || null, created: e.created
   });
   f.touched = new Set(['wallet', 'category', 'store', 'amount']);
@@ -363,6 +363,8 @@ function formDirty() {
   if (F.id) return formSnap(F) !== F.snap;
   return !!(F.store.trim() || num(F.amount) || F.items.length || F.note.trim() || F.receiptBlob);
 }
+// money shown with two decimals when an entry opens for editing (12.3 -> "12.30"); empty stays empty
+const money2 = v => (v === '' || v == null ? '' : r2(num(v)).toFixed(2));
 function computedTotal() { return r2(F.items.reduce((s, it) => s + itemTotal(it), 0)); }
 
 function renderAdd(m) {
@@ -510,6 +512,7 @@ function renderExpenseFields(card) {
   card.append(...walletChips('wallet', SPEND_WALLETS, 'Paid with'));
 
   const hasItems = F.items.length > 0;
+  card.classList.toggle('has-items', hasItems);   // room below Save, so a new item can glide to the top
   card.append(h('span', { class: 'lbl' }, hasItems ? 'Category (default for new items)' : 'Category'));
   card.append(categoryChips(CFG.expenseCats, () => F.category,
     c => { F.category = c; F.touched.add('category'); F.guessed.delete('category'); }, () => F.guessed.has('category')));
@@ -1062,9 +1065,12 @@ async function restore(file) {
     const data = JSON.parse(await jf.async('string'));
     if (data.app !== 'expenses-offline') throw new Error('This is not an Expenses export');
     const nNow = S.entries.length, nNew = data.entries.length, nPh = (data.receipts || []).filter(r => zip.file(r.path)).length;
+    const nMiss = (data.receipts || []).length - nPh;
     if (!(await ask({
       title: 'Restore from this file?',
-      lines: [`${file.name}: ${nNew} entr${nNew === 1 ? 'y' : 'ies'} and ${nPh} photo${nPh === 1 ? '' : 's'}.`, `· This replaces everything on this phone (${nNow} entr${nNow === 1 ? 'y' : 'ies'} now).`],
+      lines: [`${file.name}: ${nNew} entr${nNew === 1 ? 'y' : 'ies'} and ${nPh} photo${nPh === 1 ? '' : 's'}.`,
+        nMiss ? `⚠ ${nMiss} older photo${nMiss === 1 ? ' isn\'t' : 's aren\'t'} in this file. After restoring, the next Sync will move ${nMiss === 1 ? 'it' : 'them'} on the laptop to Receipts\\_removed. Use a Full backup to bring every photo back.` : '',
+        `· This replaces everything on this phone (${nNow} entr${nNow === 1 ? 'y' : 'ies'} now).`],
       ok: 'Restore'
     }))) return;
     if (!(await ask({
@@ -1119,13 +1125,14 @@ async function handleBack() {
 addEventListener('popstate', () => {
   backArmed = false;
   if (atHome()) {            // nothing to step back from: warn once, a second Back within 2 s closes the app
-    toast('Press back again to exit');
-    setTimeout(armBack, 2000);
+    toast('Press back again to exit');   // the guard comes back on the next tap
     return;
   }
   armBack(); handleBack();
 });
-document.addEventListener('pointerdown', armBack, true);   // any tap = still using the app
+// Chrome only honours a guard added during a real tap or key press, so re-arm on click/keydown (not at load, not on a timer)
+document.addEventListener('click', armBack, true);
+document.addEventListener('keydown', armBack, true);
 
 /* ---------- While typing: hide the bottom tab bar; keyboard "Next" moves through an item's fields ---------- */
 function updTyping() {
@@ -1157,6 +1164,6 @@ addEventListener('online', net); addEventListener('offline', net);
 (async () => {
   try { await load(); } catch (e) { $('#main').textContent = 'Storage unavailable: ' + e.message; return; }
   net(); go('add');
-  history.replaceState({ app: 'root' }, ''); armBack();
+  history.replaceState({ app: 'root' }, '');   // the Back guard is added on the first tap
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
 })();
