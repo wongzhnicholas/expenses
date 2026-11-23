@@ -1,9 +1,10 @@
 'use strict';
 /* Expenses — offline expense tracker (Phase 1)
-   All data stays in this phone's browser storage (IndexedDB). Nothing is uploaded.
+   All data stays in this phone's browser storage (IndexedDB). Nothing is uploaded, except that
+   "Find new place nearby" sends the rounded position to a map search when tapped.
    Export creates a ZIP for the laptop Sync helper. */
 
-const APP_VERSION = '1.2.2';
+const APP_VERSION = '1.3.0';
 const SCHEMA = 1;
 
 /* ---------- Your setup (edit here if wallets or categories change) ---------- */
@@ -21,7 +22,13 @@ const CFG = {
   quickCats: 6,            // category chips shown before "More"
   fillAfter: 2,            // auto-fill once the same choice was made this many times in a row
   remindDays: 7,           // remind to export after this many days
-  photoDays: 30            // every export re-sends photos from this many recent days (plus any never sent)
+  photoDays: 30,           // every export re-sends photos from this many recent days (plus any never sent)
+  geo: {                   // GPS store names (metres)
+    near: 150, acc: 100,   // "nearby" distance; a position must be at least this accurate
+    spots: 5, show: 3,     // branches kept per store; "Near you" suggestions
+    list: 15,              // names in the online list
+    url: 'https://photon.komoot.io/reverse', skip: ['atm', 'bench', 'toilets', 'parking', 'parking_space', 'bicycle_parking', 'motorcycle_parking', 'drinking_water', 'telephone', 'vending_machine', 'waste_basket', 'post_box', 'information']
+  }
 };
 const SPEND_WALLETS = CFG.wallets.filter(w => w.kind === 'spend').map(w => w.id);
 const ALL_WALLETS = CFG.wallets.map(w => w.id);
@@ -128,6 +135,7 @@ const S = {
   entries: [],            // all entries
   receipts: new Map(),    // name -> {name, entryId, exported, added}
   settings: null,
+  places: [],             // [{name, spots: [{lat, lon, at}]}]: stores remembered by position (this phone + full backup only)
   tab: 'add'
 };
 const DEFAULT_SETTINGS = () => ({
@@ -142,6 +150,7 @@ async function load() {
   S.settings = Object.assign(DEFAULT_SETTINGS(), (await DB.get('meta', 'settings')) || {});
   for (const w of ALL_WALLETS) if (!(w in S.settings.opening)) S.settings.opening[w] = 0;
   S.entries = await DB.all('entries');
+  S.places = cleanPlaces(await DB.get('meta', 'places'));
   const recs = await DB.all('receipts');
   S.receipts = new Map(recs.map(r => [r.name, { name: r.name, entryId: r.entryId, exported: !!r.exported, added: r.added || '' }]));
 }
@@ -235,6 +244,91 @@ function transferPairs() {
     const p = m.get(k); p.n++; p.amounts.set(r2(e.amount), (p.amounts.get(r2(e.amount)) || 0) + 1);
   }
   return [...m.values()].sort((a, b) => b.n - a.n).slice(0, 4);
+}
+
+/* ---------- GPS store names ----------
+   Own places work offline. Only placeSearch() goes online, and only when "Find new place nearby" is tapped. */
+let GEO_OK = false;       // location already allowed (so asking for it shows no pop-up)
+let POS = null;           // last position {lat, lon, acc, at}
+let LOCATING = null;      // the request under way
+function metres(a, b) {
+  const R = 6371000, rad = Math.PI / 180, dLat = (b.lat - a.lat) * rad, dLon = (b.lon - a.lon) * rad;
+  const q = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(q)));
+}
+async function geoInit() {
+  try {
+    const st = await navigator.permissions.query({ name: 'geolocation' });
+    GEO_OK = st.state === 'granted'; st.onchange = () => { GEO_OK = st.state === 'granted'; };
+  } catch (_) { GEO_OK = false; }
+}
+function getPos() {
+  if (POS && Date.now() - POS.at < 60000) return Promise.resolve(POS);
+  if (LOCATING) return LOCATING;
+  LOCATING = new Promise((res, rej) => {
+    if (!navigator.geolocation) { rej(new Error('This phone has no location service.')); return; }
+    navigator.geolocation.getCurrentPosition(
+      p => { GEO_OK = true; POS = { lat: p.coords.latitude, lon: p.coords.longitude, acc: p.coords.accuracy, at: Date.now() }; res(POS); },
+      e => rej(new Error(e.code === 1 ? 'Location is not allowed. Turn it on in Chrome\'s site settings for this app.'
+        : e.code === 3 ? 'No position found in time. Try again near the door.' : 'Position not available. Is Location on?')),
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 60000 });
+  }).finally(() => { LOCATING = null; });
+  return LOCATING;
+}
+const tooRough = p => p.acc > CFG.geo.acc ? `Position too rough (±${Math.round(p.acc)} m). Try near the door.` : '';
+function cleanPlaces(list) {
+  return (Array.isArray(list) ? list : []).map(p => ({
+    name: String(p && p.name || '').trim(),
+    spots: (Array.isArray(p && p.spots) ? p.spots : []).filter(q => q && isFinite(q.lat) && isFinite(q.lon)).slice(-CFG.geo.spots).map(q => ({ lat: +q.lat, lon: +q.lon, at: String(q.at || '') }))
+  })).filter(p => p.name && p.spots.length);
+}
+function nearPlaces(pos) {
+  return S.places.map(p => ({ name: p.name, d: Math.min(...p.spots.map(q => metres(pos, q))) }))
+    .filter(x => x.d <= CFG.geo.near).sort((a, b) => a.d - b.d).slice(0, CFG.geo.show);
+}
+async function rememberPlace(name, pos) {
+  const k = norm(name), spot = { lat: pos.lat, lon: pos.lon, at: new Date().toISOString() };
+  let p = S.places.find(x => norm(x.name) === k);
+  if (!p) S.places.push(p = { name, spots: [] });
+  p.name = name;
+  const i = p.spots.findIndex(q => metres(q, pos) <= CFG.geo.near);
+  if (i >= 0) p.spots.splice(i, 1);          // same branch: newer reading replaces the old one
+  p.spots.push(spot);
+  while (p.spots.length > CFG.geo.spots) p.spots.shift();   // oldest reading first
+  await DB.put('meta', S.places, 'places');
+}
+// Names of shops, eateries etc. near a position, from the free OpenStreetMap search "Photon". Sends the position only (about 11 m steps).
+async function placeSearch(pos) {
+  const u = `${CFG.geo.url}?lat=${pos.lat.toFixed(4)}&lon=${pos.lon.toFixed(4)}&radius=${CFG.geo.near / 1000}&limit=50` +
+    ['shop', 'amenity', 'leisure', 'tourism', 'craft'].map(t => '&osm_tag=' + t).join('');
+  const ac = new AbortController(), tm = setTimeout(() => ac.abort(), 15000);
+  try {
+    const r = await fetch(u, { signal: ac.signal, credentials: 'omit', referrerPolicy: 'no-referrer', cache: 'no-store' });
+    if (!r.ok) throw new Error('busy');
+    return placeList(pos, await r.json());
+  } finally { clearTimeout(tm); }
+}
+function placeList(pos, json) {
+  const seen = new Set();
+  return (json && Array.isArray(json.features) ? json.features : []).map(f => {
+    const c = f.geometry && f.geometry.coordinates || [], q = f.properties || {};
+    return { name: String(q.name || '').replace(/\s+/g, ' ').trim().slice(0, 80), kind: q.osm_value, d: metres(pos, { lat: c[1], lon: c[0] }) };
+  }).filter(x => x.name && x.d <= CFG.geo.near && !CFG.geo.skip.includes(x.kind)).sort((a, b) => a.d - b.d)
+    .filter(x => !seen.has(norm(x.name)) && seen.add(norm(x.name))).slice(0, CFG.geo.list);
+}
+// Pop-up list; resolves the chosen name, or null
+function pickPlace(list) {
+  return new Promise(res => {
+    let out = null;
+    const dlg = h('dialog', { class: 'ask' }, h('b', {}, 'Which store are you in?'),
+      h('div', { style: 'max-height:50vh;overflow:auto;margin-top:10px' }, list.map(x => h('button', {
+        class: 'ent', type: 'button', onclick: () => { out = x.name; dlg.close(); }
+      }, h('span', {}, x.name), h('span', { class: 'faint small', style: 'white-space:nowrap' }, `${Math.round(x.d)} m`)))),
+      h('button', { class: 'btn full', type: 'button', style: 'margin-top:8px', onclick: () => dlg.close() }, 'None of these (type the name)'),
+      h('p', { class: 'small muted' }, h('a', { href: 'https://www.openstreetmap.org/copyright', target: '_blank', rel: 'noopener noreferrer', style: 'color:inherit' }, '© OpenStreetMap contributors'), ' · search by Photon (komoot)'));
+    dlg.addEventListener('close', () => { dlg.remove(); res(out); });
+    document.body.append(dlg); dlg.showModal();
+  });
 }
 
 /* ---------- Receipts ---------- */
@@ -335,6 +429,7 @@ function closeViewer() { if (VIEWER) { VIEWER.close(); VIEWER = null; } }
 /* ---------- Navigation ---------- */
 let BAL_DRAW = [];      // redraw the wallet balance lines on Add/Edit
 let DATE_PAINT = null;  // redraw the date block on Add/Edit without rebuilding the form
+let NEAR_REFRESH = null;   // look for saved places again (back from the background)
 const drawBal = () => BAL_DRAW.forEach(f => f());
 let REPAINT = [];   // light refreshers for chip groups (avoid full re-render while typing)
 const TITLES = { add: 'Add', history: 'History', summary: 'Summary', wallets: 'Wallets' };
@@ -346,7 +441,7 @@ function go(tab, keep = false) {
   const editing = tab === 'add' && F && F.id;
   $('#title').textContent = editing ? 'Edit entry' : TITLES[tab];
   $('#back').hidden = !editing;
-  REPAINT = []; BAL_DRAW = []; DATE_PAINT = null;
+  REPAINT = []; BAL_DRAW = []; DATE_PAINT = null; NEAR_REFRESH = null;
   const m = $('#main'); m.innerHTML = '';
   ({ add: renderAdd, history: renderHistory, summary: renderSummary, wallets: renderWallets })[tab](m);
   window.scrollTo(0, keep && same ? y : 0);
@@ -359,6 +454,7 @@ function blankForm(type = 'expense') {
     id: null, type, date: todayStr(), time: nowTime(), store: '', wallet: CFG.defaultWallet,
     from: 'Maybank', to: 'TNG', amount: '', category: '', items: [], note: '',
     receiptBlob: null, receiptName: null, removeReceipt: false,
+    here: null, hereMsg: '',   // position to remember for this store on Save (📍)
     handDate: false, handTime: false,   // set by hand: the app must not change the date/time
     guessed: new Set(), touched: new Set(), created: null
   };
@@ -368,7 +464,8 @@ function formFromEntry(e) {
   Object.assign(f, {
     id: e.id, type: e.type, date: e.date, time: e.time || '', store: e.store || '', wallet: e.wallet || CFG.defaultWallet,
     from: e.from || 'Maybank', to: e.to || 'TNG', amount: money2(e.amount), category: e.category || '',
-    items: (e.items || []).map(it => ({ ...it, qty: String(it.qty ?? 1), unit: money2(it.unit), orig: money2(it.orig), key: uid() })),
+    items: (e.items || []).map(it => ({ ...it, qty: String(it.qty ?? 1), unit: money2(it.unit), orig: money2(it.orig), key: uid(),
+      category: it.category === e.category && CFG.expenseCats.includes(e.category) ? '' : it.category })),   // same as the main one: follow it
     note: e.note || '', receiptName: e.receipt || null, created: e.created
   });
   f.touched = new Set(['wallet', 'category', 'store', 'amount']);
@@ -381,7 +478,7 @@ const formSnap = f => JSON.stringify([f.type, f.date, f.time, f.store, f.wallet,
 function formDirty() {
   if (!F) return false;
   if (F.id) return formSnap(F) !== F.snap;
-  return !!(F.store.trim() || num(F.amount) || F.items.length || F.note.trim() || F.receiptBlob);
+  return !!(F.store.trim() || num(F.amount) || F.items.length || F.note.trim() || F.receiptBlob || F.here);
 }
 // money shown with two decimals when an entry opens for editing (12.3 -> "12.30"); empty stays empty
 const money2 = v => (v === '' || v == null ? '' : r2(num(v)).toFixed(2));
@@ -390,6 +487,8 @@ function refreshDateTime() {
   if (F && !F.id && F.type !== 'adjust' && !F.handDate && !F.handTime && !formDirty()) { F.date = todayStr(); F.time = nowTime(); }
   if (DATE_PAINT && F) DATE_PAINT();
 }
+// Items follow the main category: an item's own category is '' until it is set by hand (the saved entry always has the real one).
+const mainCat = () => (CFG.expenseCats.includes(F.category) ? F.category : '');
 function computedTotal() { return r2(F.items.reduce((s, it) => s + itemTotal(it), 0)); }
 
 function renderAdd(m) {
@@ -417,7 +516,7 @@ function renderAdd(m) {
     const seg = h('div', { class: 'seg', role: 'tablist' },
       ['expense', 'income', 'transfer'].map(t => h('button', {
         class: F.type === t ? 'on' : '', type: 'button',
-        onclick: () => { if (F.type !== t) { F.type = t; F.guessed.clear(); go('add', true); } }
+        onclick: () => { if (F.type !== t) { F.type = t; F.here = null; F.hereMsg = ''; F.guessed.clear(); go('add', true); } }
       }, t[0].toUpperCase() + t.slice(1))));
     card.append(seg);
   }
@@ -436,7 +535,7 @@ function renderAdd(m) {
 
   // date
   card.append(h('span', { class: 'lbl' }, 'Date'));
-  const dateInput = h('input', { type: 'date', value: F.date, max: todayStr(), onchange: ev => { F.date = ev.target.value || todayStr(); F.handDate = true; go('add', true); } });
+  const dateInput = h('input', { type: 'date', value: F.date, max: todayStr(), onchange: ev => { F.date = ev.target.value || todayStr(); F.handDate = true; if (F.date !== todayStr()) F.here = null; go('add', true); } });
   const timeInput = h('input', { type: 'time', value: F.time, 'aria-label': 'Time (optional)', oninput: ev => { F.time = ev.target.value; F.handTime = true; } });
   const bToday = h('button', {
     type: 'button', class: 'chip', onclick: () => {
@@ -445,7 +544,7 @@ function renderAdd(m) {
       go('add', true);
     }
   }, 'Today');
-  const bYest = h('button', { type: 'button', class: 'chip', onclick: () => { F.date = addDays(todayStr(), -1); F.time = ''; F.handDate = true; F.handTime = false; go('add', true); } }, 'Yesterday');
+  const bYest = h('button', { type: 'button', class: 'chip', onclick: () => { F.date = addDays(todayStr(), -1); F.time = ''; F.handDate = true; F.handTime = false; F.here = null; go('add', true); } }, 'Yesterday');
   const bPick = h('button', { type: 'button', class: 'chip', onclick: () => dateInput.showPicker ? dateInput.showPicker() : dateInput.focus() }, 'Pick date');
   const dateNote = h('div', { class: 'small faint', style: 'margin-top:3px' });
   DATE_PAINT = () => {
@@ -544,13 +643,13 @@ function categoryChips(cats, current, onPick, guessed) {
   return wrap;
 }
 
-function storeInput(onPicked) {
+function storeInput(onPicked, onText = () => { }) {
   const idx = storeIndex();
   const box = h('div', { class: 'sugg', hidden: true });
   const inp = h('input', {
     type: 'text', value: F.store, placeholder: 'McD, Lotus\'s Kepong, Lazada…', autocomplete: 'off',
     class: F.guessed.has('store') ? 'guess' : '',
-    oninput: ev => { F.store = ev.target.value; F.guessed.delete('store'); inp.classList.remove('guess'); show(); },
+    oninput: ev => { F.store = ev.target.value; F.guessed.delete('store'); inp.classList.remove('guess'); show(); onText(); },
     onfocus: () => show(), onblur: () => setTimeout(() => { box.hidden = true; onPicked(false); }, 180)
   });
   function show() {
@@ -561,7 +660,7 @@ function storeInput(onPicked) {
     if (!list.length || (list.length === 1 && norm(list[0].name) === q)) { box.hidden = true; return; }
     for (const s of list) box.append(h('button', {
       type: 'button', onmousedown: ev => ev.preventDefault(),
-      onclick: () => { F.store = s.name; inp.value = s.name; box.hidden = true; onPicked(true); }
+      onclick: () => { F.store = s.name; inp.value = s.name; box.hidden = true; onText(); onPicked(true); }
     }, h('span', {}, s.name), h('span', { class: 'faint small' }, `${s.count}×`)));
     box.hidden = false;
   }
@@ -579,16 +678,86 @@ function applyStoreGuesses() {
   return changed;
 }
 
+// Store field, 📍, "Near you" and "Find new place nearby". The GPS parts are only on a new entry dated today.
+function storeRow() {
+  const f = F, gps = !F.id && F.date === todayStr() && !!navigator.geolocation;
+  const guesses = () => { if (applyStoreGuesses()) REPAINT.forEach(x => x()); };
+  if (!gps) return storeInput(guesses);
+  const pin = h('button', { type: 'button', 'aria-label': 'I\'m here: remember this place', style: 'flex:0 0 48px;padding:0' }, '📍');
+  const status = h('div', { class: 'small muted', style: 'margin-top:4px' });
+  const near = h('div', { class: 'chips', style: 'margin-top:6px;min-height:32px;flex-wrap:nowrap;overflow-x:auto;align-items:center' });   // fixed height: no jump when it fills
+  const find = h('button', { type: 'button', class: 'btn link small' }, 'Find new place nearby (online)');
+  const msg = t => { f.hereMsg = t; draw(); };
+  function draw() {
+    pin.className = 'btn' + (f.here ? ' primary' : '');
+    pin.setAttribute('aria-pressed', f.here ? 'true' : 'false');
+    status.textContent = f.hereMsg || (f.here ? `Here (±${Math.round(f.here.acc)} m). Remembered when you Save.` : '');
+    status.hidden = !status.textContent;
+    const empty = !f.store.trim();
+    find.hidden = !empty;
+    near.hidden = !empty || !GEO_OK || !S.places.length;
+  }
+  function drawNear(pos, text) {
+    near.textContent = '';
+    const list = pos ? nearPlaces(pos) : [];
+    near.append(h('span', { class: 'small muted', style: 'white-space:nowrap' }, text || (list.length ? 'Near you:' : 'Near you: none of your saved places')));
+    for (const x of list) near.append(h('button', {
+      type: 'button', class: 'chip small', style: 'white-space:nowrap', onclick: () => { f.store = x.name; f.guessed.delete('store'); applyStoreGuesses(); go('add', true); }
+    }, x.name));
+  }
+  function locate() {
+    if (near.hidden) return;
+    if (!(POS && Date.now() - POS.at < 60000)) drawNear(null, 'Near you: locating…');
+    getPos().then(p => tooRough(p) ? drawNear(null, 'Near you: ' + tooRough(p)) : drawNear(p), e => drawNear(null, 'Near you: ' + e.message));
+  }
+  // a position good enough to use, or null (and the reason is shown)
+  async function goodPos(wait) {
+    msg(wait);
+    try {
+      let p = await getPos();
+      if (tooRough(p)) { POS = null; msg(tooRough(p)); return null; }
+      return p;
+    } catch (e) { msg(e.message); return null; }
+  }
+  pin.addEventListener('click', async () => {
+    if (f.here) { f.here = null; msg(''); return; }
+    const p = await goodPos('Getting your position…');
+    if (p) { f.here = { lat: p.lat, lon: p.lon, acc: p.acc }; msg(''); }
+  });
+  find.addEventListener('click', async () => {
+    if (!navigator.onLine) { msg('No internet. Type the name.'); return; }
+    find.disabled = true;
+    const p = await goodPos('Getting your position…');
+    let list = null;
+    if (p) {
+      msg('Looking up places…');
+      try { list = await placeSearch(p); } catch (_) { msg('The map search didn\'t answer. Try again, or type the name.'); }
+    }
+    find.disabled = false;
+    if (!list) return;
+    if (F !== f || S.tab !== 'add' || f.type !== 'expense' || f.store.trim() || document.querySelector('dialog[open]')) { msg(''); return; }   // moved on meanwhile
+    if (!list.length) { msg('No named places found here. Type the name.'); return; }
+    msg('');
+    const name = await pickPlace(list);
+    if (!name || F !== f || S.tab !== 'add') return;
+    f.store = name; f.here = { lat: p.lat, lon: p.lon, acc: p.acc }; f.guessed.delete('store');
+    applyStoreGuesses(); go('add', true);
+  });
+  draw(); locate();
+  NEAR_REFRESH = () => { draw(); locate(); };
+  return h('div', {}, h('div', { class: 'row' }, h('div', { class: 'grow' }, storeInput(guesses, draw)), pin), status, near, find);
+}
+
 function renderExpenseFields(card) {
   card.append(h('span', { class: 'lbl' }, 'Store'),
-    storeInput(() => { if (applyStoreGuesses()) REPAINT.forEach(f => f()); }));
+    storeRow());
   card.append(...walletChips('wallet', SPEND_WALLETS, 'Paid with'), balanceLine('wallet'));
 
   const hasItems = F.items.length > 0;
   card.classList.toggle('has-items', hasItems);   // room below Save, so a new item can glide to the top
-  card.append(h('span', { class: 'lbl' }, hasItems ? 'Category (default for new items)' : 'Category'));
+  card.append(h('span', { class: 'lbl' }, hasItems ? 'Category (for all items)' : 'Category'));
   card.append(categoryChips(CFG.expenseCats, () => F.category,
-    c => { F.category = c; F.touched.add('category'); F.guessed.delete('category'); }, () => F.guessed.has('category')));
+    c => { F.category = c; F.touched.add('category'); F.guessed.delete('category'); REPAINT.forEach(f => f()); }, () => F.guessed.has('category')));
 
   // amount or items
   if (!hasItems) {
@@ -614,8 +783,8 @@ function renderExpenseFields(card) {
   card.append(h('button', {
     type: 'button', class: 'btn link', onclick: () => {
       if (!F.items.length && num(F.amount) > 0) {
-        F.items.push({ key: uid(), name: '', qty: '1', unit: money2(F.amount), orig: '', category: F.category || '' });
-      } else F.items.push({ key: uid(), name: '', qty: '1', unit: '', orig: '', category: F.category || '' });
+        F.items.push({ key: uid(), name: '', qty: '1', unit: money2(F.amount), orig: '', category: '' });
+      } else F.items.push({ key: uid(), name: '', qty: '1', unit: '', orig: '', category: '' });
       go('add', true);
       // focus the new item's name without a jump, then glide it to the top so it stays above the keyboard
       const all = document.querySelectorAll('.item'), last = all[all.length - 1];
@@ -638,9 +807,15 @@ function itemRow(it, i, drawTotal) {
     class: it.guessUnit ? 'guess' : '', enterkeyhint: 'next', 'data-nav': '',
     oninput: ev => { it.unit = cashify(ev); it.guessUnit = false; unitInp.classList.remove('guess'); drawTotal(); }
   });
-  const catSel = h('select', { 'aria-label': 'Item category', onchange: ev => (it.category = ev.target.value), class: it.guessCat ? 'guess' : '' },
-    h('option', { value: '' }, 'Category…'),
+  const sameOpt = h('option', { value: '' });
+  const catSel = h('select', { 'aria-label': 'Item category', onchange: ev => { it.category = ev.target.value; paintCat(); } },
+    sameOpt,
     CFG.expenseCats.map(c => h('option', { value: c, selected: c === it.category }, c)));
+  function paintCat() {
+    sameOpt.textContent = mainCat() ? `Same as above: ${mainCat()}` : 'Same as above (not set yet)';
+    catSel.classList.toggle('guess', !it.category && F.guessed.has('category'));
+  }
+  paintCat(); REPAINT.push(paintCat);
   const origWrap = h('div', { class: 'row', hidden: !(it.orig !== '' && it.orig != null) && !it.showOrig },
     h('span', { class: 'small muted', style: 'white-space:nowrap' }, 'Was RM'),
     h('input', { ...MONEY, placeholder: 'original price per unit', value: it.orig ?? '', enterkeyhint: 'next', 'data-nav': '', oninput: ev => { it.orig = cashify(ev); drawTotal(); } }));
@@ -649,10 +824,8 @@ function itemRow(it, i, drawTotal) {
     it.name = name; nameInp.value = name; box.hidden = true;
     const sIdx = sI(); const here = sIdx && sIdx.items.get(norm(name));
     if (here) {
-      const units = here.hist.map(x => x.unit), cats = here.hist.map(x => x.category);
-      const ru = repeated(units); const rc = repeated(cats) || here.hist[here.hist.length - 1].category;
+      const ru = repeated(here.hist.map(x => x.unit));
       if (ru != null && !num(it.unit)) { it.unit = money2(ru); unitInp.value = it.unit; it.guessUnit = true; unitInp.classList.add('guess'); }
-      if (rc && !it.category) { it.category = rc; catSel.value = rc; it.guessCat = true; catSel.classList.add('guess'); }
       const lastO = here.hist[here.hist.length - 1].orig;
       if (lastO != null && lastO !== '' && (it.orig === '' || it.orig == null)) { it.orig = money2(lastO); origWrap.hidden = false; origWrap.querySelector('input').value = it.orig; }
     }
@@ -775,7 +948,7 @@ function validate() {
       for (const it of F.items) {
         if (!it.name.trim()) return 'Every item needs a name (or remove the empty one).';
         if (!(num(it.qty) > 0)) return `Quantity for “${it.name}” must be above 0.`;
-        if (!it.category && !F.category) return `Pick a category for “${it.name}”.`;
+        if (!it.category && !mainCat()) return `Pick a category at the top, or one for “${it.name}”.`;
       }
     } else if (!F.category) return 'Pick a category.';
   }
@@ -798,10 +971,10 @@ async function saveEntry() {
     if (F.items.length) {
       e.items = F.items.map(it => ({
         name: it.name.trim(), qty: num(it.qty), unit: r2(num(it.unit)),
-        orig: it.orig === '' || it.orig == null ? null : r2(num(it.orig)), category: it.category || F.category
+        orig: it.orig === '' || it.orig == null ? null : r2(num(it.orig)), category: it.category || mainCat()
       }));
       e.amount = computedTotal();
-      if (!e.category) e.category = e.items[0].category;
+      e.category = mainCat() || e.items[0].category;
     } else { e.items = []; e.amount = r2(num(F.amount)); }
   } else if (F.type === 'income') {
     Object.assign(e, { store: F.store.trim(), wallet: F.wallet, category: F.category, amount: r2(num(F.amount)), items: [] });
@@ -835,9 +1008,11 @@ async function saveEntry() {
   S.entries = S.entries.filter(x => x.id !== e.id).concat(e);
   await markChanged();
   requestPersist();
+  let learned = false;
+  if (F.type === 'expense' && !F.id && F.here) try { await rememberPlace(e.store, F.here); learned = true; } catch (_) { }
   const wasEdit = !!F.id;
   F = blankForm(wasEdit ? 'expense' : e.type === 'adjust' ? 'expense' : e.type);
-  toast(wasEdit ? 'Changes saved' : 'Saved');
+  toast(wasEdit ? 'Changes saved' : learned ? 'Saved · place remembered' : 'Saved');
   go(wasEdit ? 'history' : 'add');
 }
 
@@ -1037,6 +1212,24 @@ function renderWallets(m) {
     h('p', { class: 'small muted' }, 'To send by Telegram: in Telegram tap 📎 → File, open Downloads and pick the ZIP. Or copy it by USB to ExpenseSync\\Inbox.'));
   m.append(ex);
 
+  // saved places (GPS)
+  const pl = h('details', { class: 'card' }, h('summary', {}, h('b', {}, `Saved places (${S.places.length})`)),
+    h('p', { class: 'small muted' }, S.places.length ? 'Stores the app suggests when you are near them. Kept on this phone and in full backups only.'
+      : 'None yet. On Add, tap 📍 beside Store while you are there, or pick a name from Find new place nearby.'));
+  for (const p of S.places.slice().sort((a, b) => a.name.localeCompare(b.name))) pl.append(h('div', { class: 'wl' },
+    h('span', {}, p.name),
+    h('span', { class: 'row' }, h('span', { class: 'small muted', style: 'white-space:nowrap' }, `${p.spots.length} spot${p.spots.length > 1 ? 's' : ''}`),
+      h('button', {
+        class: 'btn link small', type: 'button', onclick: async () => {
+          if (!(await ask({ title: `Forget where ${p.name} is?`, lines: ['Only the position is removed. Your entries are not affected.'], ok: 'Forget' }))) return;
+          S.places = S.places.filter(x => x !== p); await DB.put('meta', S.places, 'places');
+          toast('Place removed'); go('wallets', true);
+          const d = document.querySelector('details.places'); if (d) d.open = true;
+        }
+      }, 'Remove'))));
+  pl.classList.add('places');
+  m.append(pl);
+
   // restore + storage
   const fileIn = h('input', { type: 'file', accept: '.zip,application/zip', hidden: true, onchange: ev => { const f = ev.target.files[0]; ev.target.value = ''; restore(f); } });
   const persistTxt = h('span', { class: 'small muted' }, 'Checking storage…');
@@ -1109,6 +1302,7 @@ async function buildZip(full) {
     opening: S.settings.opening, entries: sortEntries(S.entries).reverse(),
     receipts: [...S.receipts.values()].map(r => ({ name: r.name, entryId: r.entryId, path: receiptPath(r.name) }))
   };
+  if (full) data.places = S.places;   // positions go into the full backup only (the weekly ZIP may travel by Telegram)
   zip.file('data.json', JSON.stringify(data, null, 1));
   zip.file('entries.csv', '﻿' + toCSV(flatRows()));
   const sent = [];
@@ -1163,6 +1357,7 @@ async function restore(file) {
       title: 'Restore from this file?',
       lines: [`${file.name}: ${nNew} entr${nNew === 1 ? 'y' : 'ies'} and ${nPh} photo${nPh === 1 ? '' : 's'}.`,
         nMiss ? `⚠ ${nMiss} older photo${nMiss === 1 ? ' isn\'t' : 's aren\'t'} in this file. After restoring, the next Sync will move ${nMiss === 1 ? 'it' : 'them'} on the laptop to Receipts\\_removed. Use a Full backup to bring every photo back.` : '',
+        data.places ? `· Saved places: ${cleanPlaces(data.places).length} in this file will replace the ${S.places.length} on this phone.` : S.places.length ? '· Saved places on this phone are kept.' : '',
         `· This replaces everything on this phone (${nNow} entr${nNow === 1 ? 'y' : 'ies'} now).`],
       ok: 'Restore'
     }))) return;
@@ -1178,6 +1373,7 @@ async function restore(file) {
       if (f) await DB.put('receipts', { name: r.name, entryId: r.entryId, blob: await f.async('blob'), exported: true });
       else missing++;
     }
+    if (data.places) await DB.put('meta', cleanPlaces(data.places), 'places');
     S.settings.opening = Object.assign(DEFAULT_SETTINGS().opening, data.opening || {});
     S.settings.openingSet = true; S.settings.changedSinceExport = false;
     await saveSettings(); await load();
@@ -1228,7 +1424,7 @@ document.addEventListener('click', armBack, true);
 document.addEventListener('keydown', armBack, true);
 
 /* ---------- Keep the date/time of an empty Add form current ---------- */
-document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshDateTime(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { refreshDateTime(); if (NEAR_REFRESH && F && !F.store.trim()) NEAR_REFRESH(); } });
 addEventListener('pageshow', refreshDateTime);
 document.addEventListener('focusin', ev => {
   if (S.tab === 'add' && ev.target.closest && ev.target.closest('#main') && !ev.target.matches('input[type=date], input[type=time]')) refreshDateTime();
@@ -1264,6 +1460,7 @@ addEventListener('online', net); addEventListener('offline', net);
 (async () => {
   try { await load(); } catch (e) { $('#main').textContent = 'Storage unavailable: ' + e.message; return; }
   net(); go('add');
+  geoInit().then(() => { if (NEAR_REFRESH) NEAR_REFRESH(); });   // not awaited: the app must open even if this never answers
   history.replaceState({ app: 'root' }, '');   // the Back guard is added on the first tap
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => { });
 })();
