@@ -4,7 +4,7 @@
    "Find new place nearby" sends the rounded position to a map search when tapped.
    Export creates a ZIP for the laptop Sync helper. */
 
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 const SCHEMA = 1;
 
 /* ---------- Your setup (edit here if wallets or categories change) ---------- */
@@ -22,6 +22,7 @@ const CFG = {
   quickCats: 6,            // category chips shown before "More"
   fillAfter: 2,            // auto-fill once the same choice was made this many times in a row
   remindDays: 7,           // remind to export after this many days
+  nearLimit: 0.8,          // budgets: "near" from this share of the limit
   photoDays: 30,           // every export re-sends photos from this many recent days (plus any never sent)
   geo: {                   // GPS store names (metres)
     near: 150, acc: 100,   // "nearby" distance; a position must be at least this accurate
@@ -135,6 +136,8 @@ const S = {
   entries: [],            // all entries
   receipts: new Map(),    // name -> {name, entryId, exported, added}
   settings: null,
+  budgets: [],            // [{from:'YYYY-MM', limits:{category: RM}}]: each record applies from its month until the next one
+  noSpend: [],            // dates marked "nothing spent" in the Calendar
   places: [],             // [{name, spots: [{lat, lon, at}]}]: stores remembered by position (this phone + full backup only)
   tab: 'add'
 };
@@ -151,6 +154,8 @@ async function load() {
   for (const w of ALL_WALLETS) if (!(w in S.settings.opening)) S.settings.opening[w] = 0;
   S.entries = await DB.all('entries');
   S.places = cleanPlaces(await DB.get('meta', 'places'));
+  S.noSpend = cleanDates(await DB.get('meta', 'noSpend'));
+  S.budgets = cleanBudgets(await DB.get('meta', 'budgets'));
   const recs = await DB.all('receipts');
   S.receipts = new Map(recs.map(r => [r.name, { name: r.name, entryId: r.entryId, exported: !!r.exported, added: r.added || '' }]));
 }
@@ -516,7 +521,7 @@ function renderAdd(m) {
     const seg = h('div', { class: 'seg', role: 'tablist' },
       ['expense', 'income', 'transfer'].map(t => h('button', {
         class: F.type === t ? 'on' : '', type: 'button',
-        onclick: () => { if (F.type !== t) { F.type = t; F.here = null; F.hereMsg = ''; F.guessed.clear(); go('add', true); } }
+        onclick: () => { if (F.type !== t) { F.type = t; F.here = null; F.hereMsg = ''; F.guessed.clear(); fitType(); go('add', true); } }
       }, t[0].toUpperCase() + t.slice(1))));
     card.append(seg);
   }
@@ -588,6 +593,15 @@ function renderAdd(m) {
     h('button', { class: 'btn', type: 'button', onclick: () => { F = null; go('history'); } }, 'Cancel'));
   actions.append(h('button', { class: 'btn primary grow', type: 'button', onclick: saveEntry }, isEdit ? 'Save changes' : 'Save'));
   card.append(actions);
+}
+
+// After switching type: a wallet or category the new type doesn't have goes back to the default wallet / blank.
+function fitType() {
+  if (F.type === 'transfer') return;
+  const cats = F.type === 'income' ? CFG.incomeCats : CFG.expenseCats;
+  const wals = F.type === 'income' ? ALL_WALLETS : SPEND_WALLETS;
+  if (!cats.includes(F.category)) { F.category = ''; F.touched.delete('category'); }
+  if (!wals.includes(F.wallet)) { F.wallet = CFG.defaultWallet; F.touched.delete('wallet'); }
 }
 
 function walletChips(key, list, label) {
@@ -794,7 +808,7 @@ function renderExpenseFields(card) {
       }
     }
   }, '+ Add item'));
-  card.append(totalLine); drawTotal();
+  card.append(totalLine, budgetLine()); drawTotal();
 }
 
 function itemRow(it, i, drawTotal) {
@@ -808,7 +822,7 @@ function itemRow(it, i, drawTotal) {
     oninput: ev => { it.unit = cashify(ev); it.guessUnit = false; unitInp.classList.remove('guess'); drawTotal(); }
   });
   const sameOpt = h('option', { value: '' });
-  const catSel = h('select', { 'aria-label': 'Item category', onchange: ev => { it.category = ev.target.value; paintCat(); } },
+  const catSel = h('select', { 'aria-label': 'Item category', onchange: ev => { it.category = ev.target.value; paintCat(); drawBal(); } },
     sameOpt,
     CFG.expenseCats.map(c => h('option', { value: c, selected: c === it.category }, c)));
   function paintCat() {
@@ -872,7 +886,7 @@ function itemRow(it, i, drawTotal) {
       h('input', { type: 'text', inputmode: 'decimal', value: it.qty, style: 'width:64px', 'aria-label': 'Quantity', enterkeyhint: 'next', 'data-nav': '', oninput: ev => { it.qty = ev.target.value; drawTotal(); } }),
       h('div', { class: 'grow' }, unitInp)),
     origWrap,
-    h('div', { class: 'row' }, h('div', { class: 'grow' }, catSel),
+    h('div', { class: 'row', style: 'flex-wrap:wrap' }, h('div', { style: 'flex:1 0 100%' }, catSel),
       origWrap.hidden ? h('button', { type: 'button', class: 'btn link small', onclick: ev => { it.showOrig = true; origWrap.hidden = false; ev.target.remove(); } }, '+ Original price') : null)
   );
 }
@@ -1006,6 +1020,7 @@ async function saveEntry() {
 
   await DB.put('entries', e);
   S.entries = S.entries.filter(x => x.id !== e.id).concat(e);
+  if (e.type !== 'adjust' && S.noSpend.includes(e.date)) try { await setNoSpend(e.date, false); } catch (_) { }
   await markChanged();
   requestPersist();
   let learned = false;
@@ -1036,6 +1051,14 @@ async function deleteEntry() {
 
 /* ---------- History ---------- */
 let H = { q: '', limitDays: 45 };
+// The Add tab may hold an entry the user started typing: never drop it without asking
+async function okToReplace(line) {
+  return !(F && !F.id && formDirty()) || ask({ title: 'Replace the entry you started?', lines: [line], ok: 'Replace' });
+}
+async function openEdit(e) {
+  if (!(await okToReplace('What you typed on Add will be cleared so you can edit this entry.'))) return;
+  F = formFromEntry(e); go('add');
+}
 function entryLine(e) {
   let title, sub, amt, cls = '';
   if (e.type === 'expense') {
@@ -1045,15 +1068,13 @@ function entryLine(e) {
   else if (e.type === 'transfer') { title = `${e.from} → ${e.to}`; sub = 'Transfer'; amt = fmt(e.amount); cls = 'tr'; }
   else { title = `Adjustment · ${e.wallet}`; sub = 'Reconcile'; amt = (e.amount >= 0 ? '+' : '−') + fmt(Math.abs(e.amount)); cls = 'tr'; }
   if (e.note) sub += ' · ' + e.note;
-  const row = h('button', { class: 'ent', type: 'button', onclick: () => { F = formFromEntry(e); go('add'); } },
+  const row = h('button', { class: 'ent', type: 'button', onclick: () => openEdit(e) },
     h('div', {}, h('div', {}, title), h('div', { class: 'sub' }, sub)), h('div', { class: 'amt ' + cls }, amt));
   const side = [];
   if (e.receipt) side.push(h('button', { class: 'rcpt', type: 'button', 'aria-label': 'View receipt photo', onclick: () => openViewer(e.receipt) }, '🧾'));
   if (e.type !== 'adjust') side.push(h('button', {
     class: 'rcpt rep', type: 'button', 'aria-label': 'Repeat as new entry today', onclick: async () => {
-      // the Add tab may hold an entry the user started typing: don't overwrite it silently
-      if (F && !F.id && formDirty() && !(await ask({ title: 'Replace the entry you started?', lines: ['What you typed on Add will be replaced by a copy of this entry.'], ok: 'Replace' }))) return;
-      repeatEntry(e);
+      if (await okToReplace('What you typed on Add will be replaced by a copy of this entry.')) repeatEntry(e);
     }
   }, '↻'));
   if (!side.length) return row;
@@ -1129,7 +1150,22 @@ function periodStats(r) {
   }
   return { spent: r2(spent), income: r2(income), saved: r2(saved), cats, stores, count: es.length };
 }
+let SUMV = 'overview';   // which Summary screen is open
 function renderSummary(m) {
+  m.append(h('div', { class: 'chips', style: 'margin-bottom:10px' }, [['overview', 'Overview'], ['calendar', 'Calendar'], ['budgets', 'Budgets'], ['prices', 'Prices'], ['trends', 'Trends']].map(([v, t]) =>
+    h('button', {
+      type: 'button', class: 'chip' + (SUMV === v ? ' on' : ''), onclick: () => {
+        if (SUMV === v) return;
+        SUMV = v; if (v === 'calendar') CAL = { month: todayStr().slice(0, 7), day: todayStr() };
+        if (v === 'trends') TRD = { n: TRD.n, cat: null };
+        if (v === 'prices') PRC = { q: '', item: null, limit: 30 };
+        if (v === 'budgets') BUD = { month: todayStr().slice(0, 7), edit: null };
+        go('summary');
+      }
+    }, t))));
+  ({ calendar: renderCalendar, budgets: renderBudgets, prices: renderPrices, trends: renderTrends }[SUMV] || renderOverview)(m);
+}
+function renderOverview(m) {
   const r = periodRange(SUM.mode, SUM.offset), p = periodRange(SUM.mode, SUM.offset - 1);
   const st = periodStats(r), prev = periodStats(p);
   m.append(h('div', { class: 'seg' }, ['week', 'month', 'year'].map(md =>
@@ -1160,6 +1196,345 @@ function renderSummary(m) {
   if (!stores.length) sc.append(h('p', { class: 'muted small' }, 'No stores yet.'));
   for (const [name, s] of stores) sc.append(h('div', { class: 'wl' }, h('span', {}, name), h('span', { class: 'muted' }, `${s.n}× · ${fmt(s.v)}`)));
   m.append(sc);
+}
+
+/* ---------- Calendar (inside Summary) ---------- */
+let CAL = { month: '', day: '' };   // 'YYYY-MM' and the chosen day
+const cleanDates = list => [...new Set((Array.isArray(list) ? list : []).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)))].sort();
+async function setNoSpend(day, on) {
+  S.noSpend = cleanDates(on ? S.noSpend.concat(day) : S.noSpend.filter(d => d !== day));
+  await DB.put('meta', S.noSpend, 'noSpend');
+}
+// Per day: how much was spent, and whether it has an entry (a Reconcile adjustment alone doesn't count).
+// first = the first day with an entry: earlier days are never marked as missing.
+function dayIndex() {
+  const days = new Map(); let first = '';
+  for (const e of S.entries) {
+    if (e.type === 'adjust') continue;
+    if (!first || e.date < first) first = e.date;
+    const d = days.get(e.date) || { spent: 0, n: 0 };
+    d.n++; if (e.type === 'expense') d.spent = r2(d.spent + num(e.amount));
+    days.set(e.date, d);
+  }
+  return { days, first };
+}
+// 'has' (entries), 'zero' (marked nothing spent), 'miss' (past day without entries) or '' (today, future, before the first entry)
+function dayState(day, ix, today) {
+  if (ix.days.has(day)) return 'has';
+  if (!ix.first || day < ix.first || day >= today) return '';
+  return S.noSpend.includes(day) ? 'zero' : 'miss';
+}
+const cellMoney = v => (v > 0 && Math.round(v) === 0 ? '<1' : Math.round(v).toLocaleString('en-MY'));
+function monthDays(ym) {   // every day of the month, with blanks in front so weeks start on Monday
+  const [y, mo] = ym.split('-').map(Number), n = new Date(y, mo, 0).getDate();
+  const blanks = (new Date(y, mo - 1, 1).getDay() + 6) % 7;
+  return Array(blanks).fill(null).concat(Array.from({ length: n }, (_, i) => `${ym}-${pad(i + 1)}`));
+}
+function shiftMonth(ym, n) { const [y, mo] = ym.split('-').map(Number); return localDate(new Date(y, mo - 1 + n, 1)).slice(0, 7); }
+function renderCalendar(m) {
+  const today = todayStr(), ix = dayIndex();
+  if (!CAL.month) CAL = { month: today.slice(0, 7), day: today };
+  const list = monthDays(CAL.month), days = list.filter(Boolean);
+  const open = (month, day) => { CAL = { month, day }; go('summary', true); };
+  const move = n => { const mo = shiftMonth(CAL.month, n); open(mo, mo === today.slice(0, 7) ? today : ''); };
+  m.append(h('div', { class: 'navrow' },
+    h('button', { class: 'btn', type: 'button', 'aria-label': 'Previous month', onclick: () => move(-1) }, '‹'),
+    h('b', {}, `${['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'][+CAL.month.slice(5) - 1]} ${CAL.month.slice(0, 4)}`),
+    h('button', { class: 'btn', type: 'button', 'aria-label': 'Next month', disabled: CAL.month >= today.slice(0, 7), onclick: () => move(1) }, '›')));
+  const spent = r2(days.reduce((t, d) => t + (ix.days.has(d) ? ix.days.get(d).spent : 0), 0));
+  const miss = days.filter(d => dayState(d, ix, today) === 'miss').length;
+  m.append(h('p', { class: 'small muted', style: 'margin:0 0 8px' }, `Spent RM ${fmt(spent)} · ${miss ? `${miss} day${miss > 1 ? 's' : ''} with no entries` : 'no missing days'}`));
+
+  const grid = h('div', { class: 'cal' }, ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map(d => h('div', { class: 'dow' }, d)));
+  for (const d of list) {
+    if (!d) { grid.append(h('div', {})); continue; }
+    const st = dayState(d, ix, today), v = st === 'has' ? ix.days.get(d).spent : 0;
+    grid.append(h('button', {
+      type: 'button', class: 'cell' + (st === 'miss' ? ' miss' : '') + (d === today ? ' today' : '') + (d === CAL.day ? ' sel' : ''), disabled: d > today,
+      'aria-label': `${niceDate(d)}: ${st === 'has' ? `RM ${fmt(v)} spent` : st === 'miss' ? 'no entries' : st === 'zero' ? 'nothing spent' : 'nothing yet'}`,
+      'aria-pressed': d === CAL.day ? 'true' : 'false', onclick: () => open(CAL.month, d)
+    }, h('span', {}, String(+d.slice(8))), h('span', { class: 'amt' }, st === 'has' ? cellMoney(v) : st === 'miss' ? '?' : st === 'zero' ? '0' : '')));
+  }
+  m.append(grid, h('p', { class: 'small faint', style: 'margin:6px 0 0' }, '? = past day with no entries · amounts in whole RM'));
+
+  const day = CAL.day;
+  if (!day || day.slice(0, 7) !== CAL.month) { m.append(h('p', { class: 'small muted' }, 'Tap a day to see its entries.')); return; }
+  const st = dayState(day, ix, today);
+  const info = st === 'has' ? `RM ${fmt(ix.days.get(day).spent)} spent` : st === 'zero' ? 'nothing spent' : 'no entries';
+  const box = h('div', { class: 'list' }, h('div', { class: 'day' }, h('span', {}, niceDate(day)), h('span', {}, info)));
+  for (const e of sortEntries(S.entries.filter(x => x.date === day))) box.append(entryLine(e));
+  box.append(h('button', { class: 'btn full', type: 'button', style: 'margin-top:6px', onclick: () => addForDay(day) }, '+ Add an entry for this day'));
+  const mark = async on => { await setNoSpend(day, on); await markChanged(); go('summary', true); };
+  if (st === 'miss') box.append(h('button', { class: 'btn full', type: 'button', style: 'margin-top:8px', onclick: () => mark(true) }, 'Nothing spent this day'));
+  if (st === 'zero') box.append(h('button', { class: 'btn full', type: 'button', style: 'margin-top:8px', onclick: () => mark(false) }, 'Undo "Nothing spent"'));
+  m.append(box);
+}
+async function addForDay(day) {
+  if (!(await okToReplace('What you typed on Add will be cleared.'))) return;
+  F = blankForm();
+  if (day !== todayStr()) Object.assign(F, { date: day, time: '', handDate: true });
+  go('add');
+}
+
+/* ---------- Price history (inside Summary) ---------- */
+let PRC = { q: '', item: null, limit: 30 };   // item = the opened item's key (its normalised name)
+const shortDate = d => { const x = parseDate(d); return `${x.getDate()} ${MON[x.getMonth()]}${d.slice(0, 4) === todayStr().slice(0, 4) ? '' : ' ' + d.slice(0, 4)}`; };
+// Every item ever bought: key -> {key, name (latest spelling), buys: newest first}
+function priceIndex() {
+  const m = new Map();
+  for (const e of sortEntries(S.entries)) if (e.type === 'expense') for (const it of e.items || []) {
+    const k = norm(it.name); if (!k) continue;
+    if (!m.has(k)) m.set(k, { key: k, name: it.name, buys: [] });
+    m.get(k).buys.push({ date: e.date, store: e.store || '', unit: num(it.unit), qty: num(it.qty || 1), orig: it.orig, e });
+  }
+  return m;
+}
+function priceMatches(q) {
+  const words = norm(q).split(' ').filter(Boolean);
+  return [...priceIndex().values()].filter(x => {
+    const hay = x.key + ' ' + [...new Set(x.buys.map(b => norm(b.store)))].join(' ');
+    return words.every(w => hay.includes(w));
+  });   // already newest first: the index is built from the newest entry back
+}
+// Free items (RM 0) are listed as purchases but don't count as a price
+function priceStats(x) {
+  const paid = x.buys.filter(b => b.unit > 0), b = paid.length ? paid : x.buys;
+  const pick = f => b.reduce((a, c) => (f(c.unit, a.unit) ? c : a));
+  const stores = new Map();
+  for (const y of b) {
+    const k = norm(y.store);
+    if (!stores.has(k)) stores.set(k, { store: y.store, last: y.unit, n: 0 });
+    stores.get(k).n++;
+  }
+  return {
+    n: x.buys.length, last: b[0], low: pick((c, a) => c < a), high: pick((c, a) => c > a), avg: r2(b.reduce((t, y) => t + y.unit, 0) / b.length),
+    stores: [...stores.values()].sort((a, c) => a.last - c.last)
+  };
+}
+const times = n => `${n} time${n === 1 ? '' : 's'}`;
+function renderPrices(m) {
+  const x = PRC.item && priceIndex().get(PRC.item);
+  if (x) { renderPriceItem(m, x); return; }
+  PRC.item = null;
+  const list = h('div', { style: 'margin-top:10px' });
+  m.append(h('input', { type: 'search', placeholder: 'Search item or store', value: PRC.q, 'aria-label': 'Search item or store', oninput: ev => { PRC.q = ev.target.value; PRC.limit = 30; draw(); } }), list);
+  function draw() {
+    list.textContent = '';
+    const all = priceMatches(PRC.q);
+    if (!all.length) { list.append(h('p', { class: 'muted' }, norm(PRC.q) ? 'Nothing matches that search.' : 'No items yet. Prices come from expenses with items.')); return; }
+    for (const y of all.slice(0, PRC.limit)) {
+      const l = priceStats(y).last;
+      list.append(h('button', { class: 'ent', type: 'button', onclick: () => { PRC.item = y.key; go('summary'); } },
+        h('div', { style: 'min-width:0' }, h('div', {}, y.name), h('div', { class: 'sub' }, `${l.store} · ${shortDate(l.date)} · ${times(y.buys.length)}`)), h('div', { class: 'amt' }, fmt(l.unit))));
+    }
+    if (all.length > PRC.limit) list.append(h('button', { class: 'btn full', type: 'button', onclick: () => { PRC.limit += 30; draw(); } }, 'Show more'));
+  }
+  draw();
+}
+function renderPriceItem(m, x) {
+  const st = priceStats(x);
+  m.append(h('div', { class: 'row', style: 'margin-bottom:8px' },
+    h('button', { class: 'btn', type: 'button', style: 'min-width:44px', 'aria-label': 'Back to the list', onclick: () => { PRC.item = null; go('summary'); } }, '‹'),
+    h('div', { class: 'grow' }, h('b', {}, x.name), h('div', { class: 'small muted' }, `bought ${times(st.n)}`))));
+  const line = (t, b) => h('div', { class: 'wl' }, h('span', {}, t), h('span', {}, h('span', { class: 'v' }, fmt(b.unit)), h('span', { class: 'small muted' }, ` ${b.store} · ${shortDate(b.date)}`)));
+  m.append(h('div', { class: 'card' }, line('Last', st.last), line('Lowest', st.low), line('Highest', st.high),
+    h('div', { class: 'wl' }, h('span', {}, 'Average'), h('span', { class: 'v' }, fmt(st.avg)))));
+  m.append(h('div', { class: 'card' }, h('b', {}, 'By store'), h('div', { class: 'small muted' }, 'Last price there, lowest first'),
+    st.stores.map(y => h('div', { class: 'wl' }, h('span', {}, y.store), h('span', {}, h('span', { class: 'v' }, fmt(y.last)), h('span', { class: 'small muted' }, ` · ${times(y.n)}`))))));
+  m.append(h('span', { class: 'lbl' }, 'Purchases (tap to open)'));
+  for (const b of x.buys) m.append(h('button', { class: 'ent', type: 'button', onclick: () => openEdit(b.e) },
+    h('div', { style: 'min-width:0' }, h('div', {}, b.store), h('div', { class: 'sub' }, niceDate(b.date))),
+    h('div', { class: 'amt', style: 'text-align:right' }, `${b.qty === 1 ? '' : b.qty + ' × '}${fmt(b.unit)}`, b.orig != null && num(b.orig) > b.unit ? h('div', { class: 'small muted', style: 'font-weight:400' }, `was ${fmt(b.orig)}`) : null)));
+}
+
+/* ---------- Trends (inside Summary) ---------- */
+let TRD = { n: 6, cat: null };   // months shown; the opened category
+// The last n months up to the current one, oldest first, not before the first entry.
+// full = counts in averages: not the current month, and not a first month that began part-way.
+function trendData(n) {
+  const today = todayStr(), cur = today.slice(0, 7), first = dayIndex().first;
+  if (!first || first.slice(0, 7) > cur) return [];
+  const out = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const ym = shiftMonth(cur, -i);
+    if (ym < first.slice(0, 7)) continue;
+    out.push({ ym, income: 0, spent: 0, cats: new Map(), full: ym < cur && !(ym === first.slice(0, 7) && first.slice(8) !== '01') });
+  }
+  const at = new Map(out.map(x => [x.ym, x]));
+  for (const e of S.entries) {
+    const x = at.get(e.date.slice(0, 7)); if (!x) continue;
+    if (e.type === 'income') x.income = r2(x.income + num(e.amount));
+    if (e.type !== 'expense') continue;
+    x.spent = r2(x.spent + num(e.amount));
+    for (const l of expenseLines(e)) x.cats.set(l.category, r2((x.cats.get(l.category) || 0) + l.amount));
+  }
+  return out;
+}
+// average of f over the full months, or null when there is none yet
+function trendAvg(data, f) { const d = data.filter(x => x.full); return d.length ? r2(d.reduce((t, x) => t + f(x), 0) / d.length) : null; }
+const monthShort = ym => `${MON[+ym.slice(5) - 1]} ${ym.slice(0, 4)}`;
+const soFar = ym => monthShort(ym) + (ym === todayStr().slice(0, 7) ? ' so far' : '');
+const hbar = (cls, v, top) => h('div', { class: 'hb' }, h('div', { class: 'fill ' + cls, style: `width:${top > 0 ? Math.max(0, v / top * 100).toFixed(2) : 0}%` }));
+function renderTrends(m) {
+  m.append(h('div', { class: 'chips', style: 'margin-bottom:10px' }, [6, 12].map(n => h('button', {
+    type: 'button', class: 'chip small' + (TRD.n === n ? ' on' : ''), onclick: () => { TRD.n = n; go('summary', true); }
+  }, `${n} months`))));
+  const data = trendData(TRD.n);
+  if (!data.length) { m.append(h('p', { class: 'muted' }, 'No entries yet.')); return; }
+  if (TRD.cat) { renderTrendCat(m, data, TRD.cat); return; }
+  const top = Math.max(...data.map(x => Math.max(x.income, x.spent)));
+  const card = h('div', { class: 'card' }, h('b', {}, 'Income vs spending'));
+  for (const x of data.slice().reverse()) {
+    const left = r2(x.income - x.spent);
+    card.append(h('div', { class: 'tm' },
+      h('div', { class: 'row', style: 'justify-content:space-between' }, h('span', {}, soFar(x.ym)), h('span', { class: 'small ' + (left < 0 ? 'neg' : 'muted') }, `left over ${left < 0 ? '−' : '+'}${fmt(Math.abs(left))}`)),
+      h('div', { class: 'trow' }, h('span', { class: 'k' }, 'Income'), hbar('inc', x.income, top), h('span', { class: 'n' }, fmt(x.income))),
+      h('div', { class: 'trow' }, h('span', { class: 'k' }, 'Spent'), hbar('spe', x.spent, top), h('span', { class: 'n' }, fmt(x.spent)))));
+  }
+  const ai = trendAvg(data, x => x.income), as = trendAvg(data, x => x.spent);
+  card.append(h('p', { class: 'small muted', style: 'margin:12px 0 0' }, ai == null ? 'Average: no full month yet.' : `Average per full month: income ${fmt(ai)}, spending ${fmt(as)}`));
+  m.append(card);
+
+  const totals = new Map();
+  for (const x of data) for (const [c, v] of x.cats) totals.set(c, (totals.get(c) || 0) + v);
+  const cats = [...totals.entries()].filter(x => x[1] > 0).sort((a, b) => b[1] - a[1]).map(x => x[0]);
+  const cc = h('div', { class: 'card' }, h('div', { class: 'tc muted', style: 'font-size:12px' }, h('b', { style: 'color:var(--text);font-size:16px' }, 'By category'), h('span', {}), h('span', { class: 'n' }, 'this month'), h('span', { class: 'n' }, 'average')));
+  if (!cats.length) cc.append(h('p', { class: 'muted small' }, 'No spending in these months.'));
+  for (const c of cats) {
+    const vals = data.map(x => x.cats.get(c) || 0), mx = Math.max(...vals), av = trendAvg(data, x => x.cats.get(c) || 0);
+    cc.append(h('button', { type: 'button', class: 'tc', 'aria-label': `${c}: this month ${fmt(vals[vals.length - 1])}, average ${av == null ? 'not yet' : fmt(av)}`, onclick: () => { TRD.cat = c; go('summary'); } },
+      h('span', { class: 'nm' }, c),
+      h('span', { class: 'mini', 'aria-hidden': 'true' }, vals.map(v => h('i', { style: `height:${v > 0 ? Math.max(2, Math.round(v / mx * 22)) : 0}px` }))),
+      h('span', { class: 'n' }, fmt(vals[vals.length - 1])), h('span', { class: 'n' }, av == null ? '–' : fmt(av))));
+  }
+  if (cats.length) cc.append(h('p', { class: 'small faint', style: 'margin:8px 0 0' }, 'Small bars: oldest month left. Each row has its own scale. Tap a row for the amounts.'));
+  m.append(cc);
+}
+function renderTrendCat(m, data, c) {
+  const val = x => x.cats.get(c) || 0, top = Math.max(...data.map(val)), av = trendAvg(data, val);
+  m.append(h('div', { class: 'row', style: 'margin-bottom:8px' },
+    h('button', { class: 'btn', type: 'button', style: 'min-width:44px', 'aria-label': 'Back to Trends', onclick: () => { TRD.cat = null; go('summary'); } }, '‹'), h('b', { class: 'grow' }, c)));
+  const card = h('div', { class: 'card' });
+  for (const x of data.slice().reverse()) {
+    const v = val(x), L = limitsFor(x.ym)[c], st = L > 0 ? limitState(v, L) : '';
+    card.append(h('div', { class: 'tm' },
+      h('div', { class: 'row', style: 'justify-content:space-between' }, h('span', {}, soFar(x.ym)),
+        h('span', { class: st === 'over' ? 'neg' : st === 'near' ? 'near' : '' }, fmt(v) + (L > 0 ? ` / ${fmt(L)}` : '') + (st ? ' ' + st : ''))),
+      hbar('spe', v, top)));
+  }
+  card.append(h('p', { class: 'small muted', style: 'margin:12px 0 0' }, av == null ? 'Average: no full month yet.' : `Average per full month: ${fmt(av)}`));
+  m.append(card);
+}
+
+/* ---------- Budgets (inside Summary) ---------- */
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const monthName = ym => `${MONTHS[+ym.slice(5) - 1]} ${ym.slice(0, 4)}`;
+let BUD = { month: '', edit: null };   // edit = {category: text} while the limits are being changed
+function cleanBudgets(list) {
+  const m = new Map();
+  for (const b of Array.isArray(list) ? list : []) {
+    if (!b || !/^\d{4}-\d{2}$/.test(b.from) || typeof b.limits !== 'object' || !b.limits) continue;
+    m.set(b.from, { from: b.from, limits: Object.fromEntries(Object.entries(b.limits).map(([c, v]) => [c, r2(num(v))]).filter(x => x[1] > 0)) });
+  }
+  return [...m.values()].sort((a, b) => a.from.localeCompare(b.from));
+}
+// The limits of a month: the latest record from that month or earlier (past months keep the limits they had)
+function limitsFor(ym) {
+  let l = {};
+  for (const b of S.budgets) if (b.from <= ym) l = b.limits;
+  return l;
+}
+async function setLimits(limits, ym = todayStr().slice(0, 7)) {
+  S.budgets = cleanBudgets(S.budgets.filter(b => b.from !== ym).concat({ from: ym, limits }));
+  await DB.put('meta', S.budgets, 'budgets');
+}
+function spentByCat(ym, skipId = null) {
+  const m = new Map();
+  for (const e of S.entries) if (e.type === 'expense' && e.id !== skipId && e.date.slice(0, 7) === ym)
+    for (const l of expenseLines(e)) m.set(l.category, r2((m.get(l.category) || 0) + l.amount));
+  return m;
+}
+const limitState = (v, limit) => (v > limit + 0.004 ? 'over' : v >= limit * CFG.nearLimit - 0.004 ? 'near' : '');
+const pct = (v, limit) => Math.floor(v / limit * 100 + 1e-9);
+const budDirty = () => JSON.stringify(BUD.edit) !== BUD.snap;
+function renderBudgets(m) {
+  const cur = todayStr().slice(0, 7);
+  if (!BUD.month) BUD.month = cur;
+  if (BUD.edit) { renderLimits(m, cur); return; }
+  const move = n => { BUD.month = shiftMonth(BUD.month, n); go('summary', true); };
+  m.append(h('div', { class: 'navrow' },
+    h('button', { class: 'btn', type: 'button', 'aria-label': 'Previous month', onclick: () => move(-1) }, '‹'),
+    h('b', {}, monthName(BUD.month)),
+    h('button', { class: 'btn', type: 'button', 'aria-label': 'Next month', disabled: BUD.month >= cur, onclick: () => move(1) }, '›')));
+  const limits = limitsFor(BUD.month), spent = spentByCat(BUD.month), got = c => spent.get(c) || 0;
+  const cats = [...new Set(CFG.expenseCats.concat(Object.keys(limits), [...spent.keys()]))].filter(Boolean);
+  const withL = cats.filter(c => limits[c] > 0), without = cats.filter(c => !(limits[c] > 0) && got(c) > 0);
+  const card = h('div', { class: 'card' });
+  if (!withL.length) card.append(h('p', { class: 'small muted', style: 'margin:0' }, `No limits for ${monthName(BUD.month)}.` + (BUD.month === cur ? ' Tap Edit limits to set some.' : '')));
+  else card.append(h('div', { class: 'small muted' }, `With limits: RM ${fmt(withL.reduce((t, c) => t + got(c), 0))} of ${fmt(withL.reduce((t, c) => t + limits[c], 0))}`));
+  for (const c of withL) {
+    const v = got(c), L = limits[c], st = limitState(v, L);
+    card.append(h('div', { class: 'barrow' },
+      h('div', { class: 'row' }, h('span', {}, c), h('span', { class: 'small ' + (st === 'over' ? 'neg' : st === 'near' ? 'near' : 'muted'), style: 'text-align:right' },
+        `${fmt(v)} / ${fmt(L)} · ${pct(v, L)}%${st === 'over' ? ` · over ${fmt(v - L)}` : st === 'near' ? ' · near' : ''}`)),
+      h('div', { class: 'track' }, h('div', { class: 'bar ' + st, style: `width:${Math.min(100, v / L * 100)}%` }))));
+  }
+  if (without.length) card.append(h('p', { class: 'small muted', style: 'margin:12px 0 0' }, 'No limit: ' + without.map(c => `${c} ${fmt(got(c))}`).join(' · ')));
+  m.append(card);
+  m.append(h('button', {
+    class: 'btn full', type: 'button', onclick: () => {
+      const l = limitsFor(cur); BUD.edit = {};
+      for (const c of CFG.expenseCats) BUD.edit[c] = l[c] ? money2(l[c]) : '';
+      BUD.snap = JSON.stringify(BUD.edit); go('summary');
+    }
+  }, 'Edit limits'));
+}
+function renderLimits(m, cur) {
+  const card = h('div', { class: 'card' }, h('b', {}, 'Monthly limits'),
+    h('p', { class: 'small muted' }, `From ${monthName(cur)} on. Earlier months keep their limits. Leave blank for no limit.`));
+  for (const c of CFG.expenseCats) card.append(h('div', { class: 'row', style: 'margin-top:6px' },
+    h('span', { style: 'flex:1' }, c),
+    h('div', { style: 'width:130px' }, h('input', { ...MONEY, value: BUD.edit[c], placeholder: 'no limit', 'aria-label': `Limit for ${c}`, oninput: ev => { BUD.edit[c] = cashify(ev); } }))));
+  card.append(h('div', { class: 'row', style: 'margin-top:12px' },
+    h('button', { class: 'btn', type: 'button', onclick: () => handleBack() }, 'Cancel'),
+    h('button', {
+      class: 'btn primary grow', type: 'button', onclick: async () => {
+        if (budDirty()) {
+          const keep = Object.fromEntries(Object.entries(limitsFor(cur)).filter(([c]) => !CFG.expenseCats.includes(c)));
+          await setLimits({ ...keep, ...Object.fromEntries(Object.entries(BUD.edit).map(([c, v]) => [c, r2(num(v))])) }, cur);
+          await markChanged(); requestPersist(); toast('Limits saved');
+        }
+        BUD.edit = null; BUD.month = cur; go('summary');
+      }
+    }, 'Save limits')));
+  m.append(card);
+}
+// Add/Edit: one line per category that is near or over its limit in the entry's own month (the entry being edited isn't counted twice)
+function budgetWarnings(base) {
+  const lim = limitsFor(F.date.slice(0, 7)), here = new Map();
+  if (F.items.length) for (const it of F.items) { const c = it.category || mainCat(); if (c) here.set(c, r2((here.get(c) || 0) + itemTotal(it))); }
+  else if (mainCat()) here.set(mainCat(), r2(num(F.amount)));
+  const out = [];
+  for (const [c, a] of here) {
+    if (!(lim[c] > 0)) continue;
+    const before = base.get(c) || 0, after = r2(before + a), st = limitState(after, lim[c]);
+    if (!st) continue;
+    const when = F.date.slice(0, 7) === todayStr().slice(0, 7) ? 'this month' : `in ${monthName(F.date.slice(0, 7))}`;
+    out.push({ st, text: `${st === 'over' ? 'Over limit' : 'Near limit'} · ${c}: RM ${fmt(before)} of ${fmt(lim[c])} ${when}` + (a > 0 ? ` · after this RM ${fmt(after)} (${pct(after, lim[c])}%)` : '') });
+  }
+  return out;
+}
+function budgetLine() {
+  const el = h('div', {});
+  let key = '', base = null;
+  const draw = () => {
+    const k = F.date.slice(0, 7);
+    if (k !== key) { key = k; base = spentByCat(k, F.id); }
+    el.textContent = '';
+    for (const w of budgetWarnings(base)) el.append(h('div', { class: 'budwarn ' + w.st }, w.text));
+  };
+  draw(); BAL_DRAW.push(draw); REPAINT.push(draw);
+  return el;
 }
 
 /* ---------- Wallets, reconcile, export ---------- */
@@ -1302,6 +1677,8 @@ async function buildZip(full) {
     opening: S.settings.opening, entries: sortEntries(S.entries).reverse(),
     receipts: [...S.receipts.values()].map(r => ({ name: r.name, entryId: r.entryId, path: receiptPath(r.name) }))
   };
+  data.noSpend = S.noSpend;
+  data.budgets = S.budgets;
   if (full) data.places = S.places;   // positions go into the full backup only (the weekly ZIP may travel by Telegram)
   zip.file('data.json', JSON.stringify(data, null, 1));
   zip.file('entries.csv', '﻿' + toCSV(flatRows()));
@@ -1374,6 +1751,8 @@ async function restore(file) {
       else missing++;
     }
     if (data.places) await DB.put('meta', cleanPlaces(data.places), 'places');
+    if (data.budgets) await DB.put('meta', cleanBudgets(data.budgets), 'budgets');
+    if (data.noSpend) await DB.put('meta', cleanDates(data.noSpend), 'noSpend');
     S.settings.opening = Object.assign(DEFAULT_SETTINGS().opening, data.opening || {});
     S.settings.openingSet = true; S.settings.changedSinceExport = false;
     await saveSettings(); await load();
@@ -1406,6 +1785,13 @@ async function handleBack() {
     if (formDirty() && !(await ask({ title: 'Discard changes?', lines: ['Your changes to this entry will be lost.'], ok: 'Discard' }))) return;
     F = null; go('history'); return;
   }
+  if (S.tab === 'summary' && SUMV === 'budgets' && BUD.edit) {
+    if (budDirty() && !(await ask({ title: 'Discard changes?', lines: ['Your changes to the limits will be lost.'], ok: 'Discard' }))) return;
+    BUD.edit = null; go('summary'); return;
+  }
+  if (S.tab === 'summary' && SUMV === 'prices' && PRC.item) { PRC.item = null; go('summary'); return; }
+  if (S.tab === 'summary' && SUMV === 'trends' && TRD.cat) { TRD.cat = null; go('summary'); return; }
+  if (S.tab === 'summary' && SUMV !== 'overview') { SUMV = 'overview'; go('summary'); return; }
   if (S.tab !== 'add') { go('add'); return; }
   if (formDirty() && await ask({ title: 'Discard this entry?', lines: ['What you have typed will be cleared.'], ok: 'Discard' })) {
     F = blankForm(F.type); go('add');
