@@ -1,5 +1,5 @@
 // Offline cache for the app's own files. Your entries are NOT here: they live in IndexedDB on the phone.
-const VERSION = 'expenses-v1.2.1';
+const VERSION = 'expenses-v1.2.2';
 const FILES = [
   './', 'index.html', 'app.css', 'app.js', 'vendor/jszip.min.js', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png'

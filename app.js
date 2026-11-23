@@ -3,7 +3,7 @@
    All data stays in this phone's browser storage (IndexedDB). Nothing is uploaded.
    Export creates a ZIP for the laptop Sync helper. */
 
-const APP_VERSION = '1.2.1';
+const APP_VERSION = '1.2.2';
 const SCHEMA = 1;
 
 /* ---------- Your setup (edit here if wallets or categories change) ---------- */
@@ -157,9 +157,10 @@ function effects(e) {
   }
   return {};
 }
-function balances() {
+// skipId = leave out one entry (the one being edited)
+function balances(skipId = null) {
   const b = Object.assign({}, S.settings.opening);
-  for (const e of S.entries) for (const [w, d] of Object.entries(effects(e))) b[w] = r2((b[w] || 0) + d);
+  for (const e of S.entries) if (e.id !== skipId) for (const [w, d] of Object.entries(effects(e))) b[w] = r2((b[w] || 0) + d);
   return b;
 }
 const itemTotal = it => r2(num(it.qty || 1) * num(it.unit));
@@ -332,6 +333,9 @@ async function openViewer(name, blob, label) {
 function closeViewer() { if (VIEWER) { VIEWER.close(); VIEWER = null; } }
 
 /* ---------- Navigation ---------- */
+let BAL_DRAW = [];      // redraw the wallet balance lines on Add/Edit
+let DATE_PAINT = null;  // redraw the date block on Add/Edit without rebuilding the form
+const drawBal = () => BAL_DRAW.forEach(f => f());
 let REPAINT = [];   // light refreshers for chip groups (avoid full re-render while typing)
 const TITLES = { add: 'Add', history: 'History', summary: 'Summary', wallets: 'Wallets' };
 // keep = redraw the same screen without jumping back to the top (adding an item, picking a photo, ...)
@@ -342,7 +346,7 @@ function go(tab, keep = false) {
   const editing = tab === 'add' && F && F.id;
   $('#title').textContent = editing ? 'Edit entry' : TITLES[tab];
   $('#back').hidden = !editing;
-  REPAINT = [];
+  REPAINT = []; BAL_DRAW = []; DATE_PAINT = null;
   const m = $('#main'); m.innerHTML = '';
   ({ add: renderAdd, history: renderHistory, summary: renderSummary, wallets: renderWallets })[tab](m);
   window.scrollTo(0, keep && same ? y : 0);
@@ -355,6 +359,7 @@ function blankForm(type = 'expense') {
     id: null, type, date: todayStr(), time: nowTime(), store: '', wallet: CFG.defaultWallet,
     from: 'Maybank', to: 'TNG', amount: '', category: '', items: [], note: '',
     receiptBlob: null, receiptName: null, removeReceipt: false,
+    handDate: false, handTime: false,   // set by hand: the app must not change the date/time
     guessed: new Set(), touched: new Set(), created: null
   };
 }
@@ -380,10 +385,16 @@ function formDirty() {
 }
 // money shown with two decimals when an entry opens for editing (12.3 -> "12.30"); empty stays empty
 const money2 = v => (v === '' || v == null ? '' : r2(num(v)).toFixed(2));
+// An empty new form follows the clock; once something is typed (or the date/time is set by hand) it stays put.
+function refreshDateTime() {
+  if (F && !F.id && F.type !== 'adjust' && !F.handDate && !F.handTime && !formDirty()) { F.date = todayStr(); F.time = nowTime(); }
+  if (DATE_PAINT && F) DATE_PAINT();
+}
 function computedTotal() { return r2(F.items.reduce((s, it) => s + itemTotal(it), 0)); }
 
 function renderAdd(m) {
   if (!F) F = blankForm();
+  refreshDateTime();
   const isEdit = !!F.id;
   // banners
   if (!S.settings.openingSet && !isEdit)
@@ -425,17 +436,34 @@ function renderAdd(m) {
 
   // date
   card.append(h('span', { class: 'lbl' }, 'Date'));
-  const t = todayStr(), y = addDays(t, -1);
-  const dateInput = h('input', { type: 'date', value: F.date, max: t, onchange: ev => { F.date = ev.target.value || t; go('add', true); } });
-  card.append(h('div', { class: 'chips' },
-    h('button', { type: 'button', class: 'chip' + (F.date === t ? ' on' : ''), onclick: () => { F.date = t; if (!F.time) F.time = nowTime(); go('add', true); } }, 'Today'),
-    h('button', { type: 'button', class: 'chip' + (F.date === y ? ' on' : ''), onclick: () => { F.date = y; F.time = ''; go('add', true); } }, 'Yesterday'),
-    h('button', { type: 'button', class: 'chip' + (F.date !== t && F.date !== y ? ' on' : ''), onclick: () => dateInput.showPicker ? dateInput.showPicker() : dateInput.focus() }, 'Pick date')
-  ));
+  const dateInput = h('input', { type: 'date', value: F.date, max: todayStr(), onchange: ev => { F.date = ev.target.value || todayStr(); F.handDate = true; go('add', true); } });
+  const timeInput = h('input', { type: 'time', value: F.time, 'aria-label': 'Time (optional)', oninput: ev => { F.time = ev.target.value; F.handTime = true; } });
+  const bToday = h('button', {
+    type: 'button', class: 'chip', onclick: () => {
+      F.date = todayStr(); F.handDate = false;
+      if (!F.time) { F.time = nowTime(); F.handTime = false; }
+      go('add', true);
+    }
+  }, 'Today');
+  const bYest = h('button', { type: 'button', class: 'chip', onclick: () => { F.date = addDays(todayStr(), -1); F.time = ''; F.handDate = true; F.handTime = false; go('add', true); } }, 'Yesterday');
+  const bPick = h('button', { type: 'button', class: 'chip', onclick: () => dateInput.showPicker ? dateInput.showPicker() : dateInput.focus() }, 'Pick date');
+  const dateNote = h('div', { class: 'small faint', style: 'margin-top:3px' });
+  DATE_PAINT = () => {
+    const t = todayStr(), y = addDays(t, -1);
+    bToday.classList.toggle('on', F.date === t);
+    bYest.classList.toggle('on', F.date === y);
+    bPick.classList.toggle('on', F.date !== t && F.date !== y);
+    dateInput.max = t;
+    if (dateInput.value !== F.date) dateInput.value = F.date;
+    if (timeInput.value !== F.time) timeInput.value = F.time;
+    dateNote.textContent = niceDate(F.date) + (F.time ? '' : ' · time optional');
+  };
+  DATE_PAINT();
+  card.append(h('div', { class: 'chips' }, bToday, bYest, bPick));
   card.append(h('div', { class: 'row', style: 'margin-top:6px' },
     h('div', { class: 'grow' }, dateInput),
-    h('div', { style: 'width:136px' }, h('input', { type: 'time', value: F.time, 'aria-label': 'Time (optional)', oninput: ev => (F.time = ev.target.value) }))));
-  card.append(h('div', { class: 'small faint', style: 'margin-top:3px' }, niceDate(F.date) + (F.time ? '' : ' · time optional')));
+    h('div', { style: 'width:136px' }, timeInput)));
+  card.append(dateNote);
 
   if (F.type === 'expense') renderExpenseFields(card);
   else if (F.type === 'income') renderIncomeFields(card);
@@ -471,10 +499,32 @@ function walletChips(key, list, label) {
   });
   for (const w of list) wrap.append(h('button', {
     type: 'button', class: 'chip', 'data-v': w,
-    onclick: () => { F[key] = w; F.touched.add(key); F.guessed.delete(key); paint(); }
+    onclick: () => { F[key] = w; F.touched.add(key); F.guessed.delete(key); paint(); drawBal(); }
   }, w));
   paint(); REPAINT.push(paint);
   return [h('span', { class: 'lbl' }, label), wrap];
+}
+
+// What the chosen wallet (key = wallet / from / to) holds, and what it will hold after this entry (null = no amount yet).
+// When editing, the saved version of the entry is left out, so it isn't counted twice.
+function walletPreview(key, base) {
+  const a = F.type === 'expense' && F.items.length ? computedTotal() : r2(num(F.amount));
+  const w = F[key], now = r2(base[w] || 0);
+  if (!(a > 0) || (F.type === 'transfer' && F.from === F.to)) return { w, now, after: null };
+  const d = effects({ type: F.type, wallet: F.wallet, from: F.from, to: F.to, amount: a })[w] || 0;
+  return { w, now, after: r2(now + d) };
+}
+function balanceLine(key) {
+  const el = h('div', { class: 'small muted', style: 'margin-top:6px' }), base = balances(F.id);
+  const money = v => h('span', { class: v < 0 ? 'neg' : null }, `RM ${fmt(v)}`);
+  const draw = () => {
+    const p = walletPreview(key, base);
+    el.textContent = '';
+    el.append(`${p.w} ${F.id ? 'before this' : 'now'} `, money(p.now));
+    if (p.after != null) el.append(' · after this ', money(p.after));
+  };
+  draw(); BAL_DRAW.push(draw); REPAINT.push(draw);
+  return el;
 }
 
 function categoryChips(cats, current, onPick, guessed) {
@@ -532,7 +582,7 @@ function applyStoreGuesses() {
 function renderExpenseFields(card) {
   card.append(h('span', { class: 'lbl' }, 'Store'),
     storeInput(() => { if (applyStoreGuesses()) REPAINT.forEach(f => f()); }));
-  card.append(...walletChips('wallet', SPEND_WALLETS, 'Paid with'));
+  card.append(...walletChips('wallet', SPEND_WALLETS, 'Paid with'), balanceLine('wallet'));
 
   const hasItems = F.items.length > 0;
   card.classList.toggle('has-items', hasItems);   // room below Save, so a new item can glide to the top
@@ -545,7 +595,7 @@ function renderExpenseFields(card) {
     card.append(h('span', { class: 'lbl' }, 'Amount (RM)'),
       h('input', {
         ...MONEY, class: 'big' + (F.guessed.has('amount') ? ' guess' : ''), value: F.amount, placeholder: '0.00',
-        oninput: ev => { F.amount = cashify(ev); F.guessed.delete('amount'); ev.target.classList.remove('guess'); }
+        oninput: ev => { F.amount = cashify(ev); F.guessed.delete('amount'); ev.target.classList.remove('guess'); drawBal(); }
       }));
   }
   card.append(h('span', { class: 'lbl' }, hasItems ? 'Items' : 'Items (optional)'));
@@ -553,6 +603,7 @@ function renderExpenseFields(card) {
   card.append(itemsBox);
   const totalLine = h('div', { class: 'totalline' });
   const drawTotal = () => {
+    drawBal();
     if (!F.items.length) { totalLine.innerHTML = ''; return; }
     const saved = F.items.reduce((s, it) => s + (num(it.orig) > num(it.unit) ? (num(it.orig) - num(it.unit)) * num(it.qty || 1) : 0), 0);
     totalLine.innerHTML = `<span>Total paid</span><b>RM ${fmt(computedTotal())}</b>`;
@@ -658,9 +709,9 @@ function renderIncomeFields(card) {
     h('input', { type: 'text', value: F.store, placeholder: 'Allowance, part-time pay, TNG GO+…', oninput: ev => (F.store = ev.target.value) }));
   card.append(h('span', { class: 'lbl' }, 'Category'));
   card.append(categoryChips(CFG.incomeCats, () => F.category, c => { F.category = c; F.touched.add('category'); }, () => false));
-  card.append(...walletChips('wallet', SPEND_WALLETS.concat(['FD']), 'Received into'));
+  card.append(...walletChips('wallet', SPEND_WALLETS.concat(['FD']), 'Received into'), balanceLine('wallet'));
   card.append(h('span', { class: 'lbl' }, 'Amount (RM)'),
-    h('input', { ...MONEY, class: 'big', value: F.amount, placeholder: '0.00', oninput: ev => (F.amount = cashify(ev)) }));
+    h('input', { ...MONEY, class: 'big', value: F.amount, placeholder: '0.00', oninput: ev => { F.amount = cashify(ev); drawBal(); } }));
 }
 
 function renderTransferFields(card) {
@@ -674,10 +725,10 @@ function renderTransferFields(card) {
         go('add', true);
       }
     }, `${p.from} → ${p.to}`))));
-  card.append(...walletChips('from', ALL_WALLETS, 'From'));
-  card.append(...walletChips('to', ALL_WALLETS, 'To'));
+  card.append(...walletChips('from', ALL_WALLETS, 'From'), balanceLine('from'));
+  card.append(...walletChips('to', ALL_WALLETS, 'To'), balanceLine('to'));
   card.append(h('span', { class: 'lbl' }, 'Amount (RM)'),
-    h('input', { ...MONEY, class: 'big', value: F.amount, placeholder: '0.00', oninput: ev => (F.amount = cashify(ev)) }));
+    h('input', { ...MONEY, class: 'big', value: F.amount, placeholder: '0.00', oninput: ev => { F.amount = cashify(ev); drawBal(); } }));
   const p = pairs.find(x => x.from === F.from && x.to === F.to);
   if (p) {
     const common = [...p.amounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(a => a[0]);
@@ -1175,6 +1226,13 @@ addEventListener('popstate', () => {
 // Chrome only honours a guard added during a real tap or key press, so re-arm on click/keydown (not at load, not on a timer)
 document.addEventListener('click', armBack, true);
 document.addEventListener('keydown', armBack, true);
+
+/* ---------- Keep the date/time of an empty Add form current ---------- */
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshDateTime(); });
+addEventListener('pageshow', refreshDateTime);
+document.addEventListener('focusin', ev => {
+  if (S.tab === 'add' && ev.target.closest && ev.target.closest('#main') && !ev.target.matches('input[type=date], input[type=time]')) refreshDateTime();
+});
 
 /* ---------- While typing: hide the bottom tab bar; keyboard "Next" moves through an item's fields ---------- */
 function updTyping() {
